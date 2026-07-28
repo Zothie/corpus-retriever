@@ -1,5 +1,7 @@
 # Corpus Retriever
 
+<img width="1280" height="800" alt="screenshot-1-idle" src="https://github.com/user-attachments/assets/32ad9f8d-1203-4004-ba9f-c0581e84bf53" />
+
 **Paste a DOI. Get the PDF.**
 
 A Chrome extension for downloading academic papers. Click the toolbar icon, paste the paper's
