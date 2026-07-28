@@ -1,0 +1,291 @@
+/* The toolbar panel, in Corpus Studio's design language.
+ *
+ * The tokens, the fonts and the control shapes are lifted from the app rather than
+ * approximated: this popup and the app's Ingest screen do the same job, and a near-miss
+ * (slightly different orange, slightly different radius) reads as a cheap imitation in a way
+ * that a deliberate difference would not.
+ *
+ * No dark-scheme variant. The app has none, and inventing one here would make the two look
+ * unrelated on exactly the machines where they sit side by side.
+ */
+
+@font-face {
+  font-family: 'Instrument Sans';
+  font-style: normal;
+  font-weight: 400;
+  font-display: swap;
+  src: url('fonts/instrument-sans-latin-400-normal.woff2') format('woff2');
+}
+@font-face {
+  font-family: 'Instrument Sans';
+  font-style: normal;
+  font-weight: 500;
+  font-display: swap;
+  src: url('fonts/instrument-sans-latin-500-normal.woff2') format('woff2');
+}
+@font-face {
+  font-family: 'Instrument Sans';
+  font-style: normal;
+  font-weight: 600;
+  font-display: swap;
+  src: url('fonts/instrument-sans-latin-600-normal.woff2') format('woff2');
+}
+@font-face {
+  font-family: 'Geist Mono';
+  font-style: normal;
+  font-weight: 400;
+  font-display: swap;
+  src: url('fonts/geist-mono-latin-400-normal.woff2') format('woff2');
+}
+
+:root {
+  --bg: #fffaf5;
+  --panel: #faf8f5;
+  --panel-2: #f1ece5;
+  --border: #ece7e0;
+  --ink: #211a12;
+  --muted: #6b6157;
+  --muted-2: #8a8073;
+  --muted-3: #a89e91;
+  --accent: #e2600f;
+  --accent-strong: #c2510c;
+  --ok: #3f9166;
+  --danger: #c1584a;
+  --danger-soft: #f9edeb;
+  --sans: 'Instrument Sans', system-ui, sans-serif;
+  --mono: 'Geist Mono', ui-monospace, monospace;
+}
+
+* { box-sizing: border-box; }
+
+/* `details` and `li` carry their own display, which beats the UA's [hidden] rule -- without
+   this the settings block stays on screen after being hidden. */
+[hidden] { display: none !important; }
+
+/* The popup FRAME belongs to Chrome, and no page CSS reaches it.
+ *
+ * This was tried the obvious way first: border-radius on `html` computes correctly (16px,
+ * confirmed against a really-loaded extension) and the corners still render square, because
+ * the rounding Chrome does or does not apply is a property of its own window. Chromium
+ * bug 40852436 -- "Cannot change extensions' popup's shape" -- is the same finding.
+ *
+ * So the page stops fighting for a curve it cannot win and does the one thing that actually
+ * matters: fill EDGE TO EDGE in the app's cream. A transparent html was worse than useless
+ * here -- it let Chrome's white show through at the corners, which is the pale notch that
+ * looked like a missing radius in the first place. Both elements are painted, so whatever
+ * shape Chrome gives the window, every pixel of it is ours. */
+html {
+  background: var(--bg);
+}
+
+/* A warm vertical wash plus a faint bloom behind the header.
+ *
+ * Both are very low contrast on purpose -- 5 points of luminance across the whole panel. A
+ * gradient you can NAME is decoration; this one only stops the surface reading as flat card
+ * stock, which is what a single flat cream at 380px wide looks like. Fixed attachment so the
+ * wash belongs to the panel and does not slide when the attempts list grows. */
+body {
+  width: 380px;
+  margin: 0;
+  padding: 18px;
+  color: var(--ink);
+  font-family: var(--sans);
+  font-size: 14px;
+  font-feature-settings: 'cv11', 'ss01';
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+  background:
+    radial-gradient(120% 60% at 50% -10%, rgba(226, 96, 15, 0.055), transparent 62%),
+    linear-gradient(180deg, #fffdfb 0%, var(--bg) 38%, #fdf6ef 100%);
+  background-attachment: local;
+}
+
+/* The app's eyebrow: mono, uppercase, wide tracking. It is the label idiom every card in
+   Corpus Studio opens with. */
+h1 {
+  margin: 0;
+  font-family: var(--mono);
+  text-transform: uppercase;
+  letter-spacing: 0.12em;
+  font-size: 11px;
+  font-weight: 400;
+  color: var(--muted-3);
+}
+
+.note {
+  margin: 6px 0 14px;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+form {
+  display: flex;
+  gap: 10px;
+}
+
+/* 44px rather than the app's 48: a popup is a denser surface than a full screen, and the
+   proportions hold at the smaller height. */
+#identifier,
+#email {
+  flex: 1;
+  min-width: 0;
+  height: 44px;
+  padding: 0 14px;
+  border: 1px solid #ddd6cc;
+  border-radius: 12px;
+  background: #fff;
+  color: var(--ink);
+  font-family: var(--sans);
+  font-size: 14px;
+  outline: none;
+  transition: border-color 0.2s ease, box-shadow 0.2s ease;
+}
+
+#identifier::placeholder,
+#email::placeholder {
+  color: var(--muted-3);
+}
+
+#identifier:focus,
+#email:focus {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px rgba(226, 96, 15, 0.12);
+}
+
+#identifier:disabled {
+  background: var(--panel);
+  color: var(--muted-2);
+}
+
+button {
+  height: 44px;
+  padding: 0 20px;
+  border: none;
+  border-radius: 12px;
+  background: var(--accent);
+  color: #fff;
+  font-family: var(--sans);
+  font-size: 14px;
+  font-weight: 600;
+  cursor: pointer;
+  white-space: nowrap;
+  box-shadow: 0 6px 16px rgba(226, 96, 15, 0.24);
+}
+
+button:hover:not(:disabled) { background: var(--accent-strong); }
+
+button:active:not(:disabled) {
+  background: var(--accent-strong);
+  filter: brightness(0.94);
+  box-shadow: 0 3px 9px rgba(226, 96, 15, 0.2);
+}
+
+button:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+button:disabled {
+  opacity: 0.5;
+  cursor: default;
+  box-shadow: none;
+}
+
+.msg {
+  margin: 12px 0 0;
+  font-size: 12px;
+  line-height: 1.5;
+  color: var(--muted);
+  overflow-wrap: anywhere;
+}
+
+.msg.is-ok { color: var(--ok); }
+
+/* A failure gets a surface, not just a colour. As bare text it was indistinguishable from
+   the working line at a glance, which is the one pair that must never be confused. */
+.msg.is-error {
+  color: var(--danger);
+  background: var(--danger-soft);
+  border-radius: 10px;
+  padding: 10px 12px;
+}
+
+.msg strong { font-weight: 600; }
+
+/* Where it looked. Subordinate to the headline above it, and no longer monospaced -- the
+   lines are now sentences ("Springer — needs a subscription"), and mono made ordinary words
+   look like a stack trace, which is precisely the impression to avoid. */
+.attempts-label {
+  margin: 12px 0 0;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.01em;
+  color: var(--muted-2);
+}
+
+#attempts {
+  margin: 5px 0 0;
+  padding: 0;
+  list-style: none;
+  font-size: 12px;
+  line-height: 1.65;
+  color: var(--muted);
+  max-height: 152px;
+  overflow-y: auto;
+}
+
+#attempts li {
+  overflow-wrap: anywhere;
+  padding-left: 12px;
+  position: relative;
+}
+
+/* A dot rather than a bullet glyph: lighter, and it aligns to the text baseline. */
+#attempts li::before {
+  content: '';
+  position: absolute;
+  left: 2px;
+  top: 8px;
+  width: 3px;
+  height: 3px;
+  border-radius: 50%;
+  background: var(--muted-3);
+}
+
+#settings {
+  margin-top: 16px;
+  border-top: 1px solid var(--border);
+  padding-top: 12px;
+}
+
+#settings summary {
+  cursor: pointer;
+  font-size: 12px;
+  color: var(--muted-2);
+  list-style: none;
+}
+
+#settings summary::-webkit-details-marker { display: none; }
+
+#settings summary::before {
+  content: '▸';
+  display: inline-block;
+  margin-right: 6px;
+  color: var(--muted-3);
+  transition: transform 0.15s ease;
+}
+
+#settings[open] summary::before { transform: rotate(90deg); }
+
+#settings label {
+  display: block;
+  margin: 12px 0 6px;
+  font-size: 12px;
+  color: var(--muted);
+}
+
+#settings label span { color: var(--muted-3); }
+
+::-webkit-scrollbar { width: 10px; }
+::-webkit-scrollbar-thumb { background: #e6ded3; border-radius: 999px; }
+::-webkit-scrollbar-thumb:hover { background: #d8cec0; }

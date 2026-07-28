@@ -1,0 +1,6 @@
+# Build output. `npm run build` regenerates it from extension/ in seconds, and the zip is a
+# 220 KB binary that would churn on every change.
+dist-store/
+*.zip
+
+node_modules/

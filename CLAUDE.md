@@ -1,0 +1,164 @@
+# CLAUDE.md — Corpus Retriever (Chrome extension)
+
+Guidance for Claude Code working in this standalone repo (github.com/Zothie/corpus-retriever).
+
+IMPORTANT: NEVER USE EMOJIS ANYWHERE IN LOGGING, CODE OR OTHER TEXT!
+
+IMPORTANT: Treat this as work in progress. Never add backwards-compatibility or legacy
+support unless explicitly asked. Remove code that becomes redundant.
+
+## What this is
+
+An MV3 Chrome extension that retrieves academic PDFs **inside the user's own browser**, and
+saves them to the browser's Downloads folder. It exists because publishers (Cloudflare, AWS
+WAF, F5) serve a JS challenge that cannot be satisfied from outside a real browser:
+`cf_clearance` is bound to the TLS fingerprint, UA and IP that earned it, and headless Chrome
+is re-challenged even holding a valid one.
+
+Two front doors, one engine:
+
+- **Toolbar popup** (`popup.html`) — the user pastes an identifier and gets a PDF.
+- **Native messaging** — Corpus Studio drives the same retrieval over a unix socket.
+
+Both call `runDownload()`. That sharing is deliberate: a download from the toolbar and one
+from the desktop app must produce the same file, the same name and the same failure text.
+
+## THE MV3 TRAPS (each of these has already shipped as a bug)
+
+**1. `extension/background.js` must contain NO `import` statements.** Not static, not dynamic.
+A static import breaks worker registration; a dynamic `import()` throws at runtime and kills
+the worker *silently*.
+
+The sibling files (`search-sources.js`, `oa-sources.js`, `mirror-sources.js`,
+`publishers-bundle.js`) are therefore INLINED into `background.js` — they are kept alongside
+it as readable sources and as test fixtures, but the worker uses only its own inlined copies.
+**Editing a sibling alone changes nothing at runtime**; the inlined region in `background.js`
+is what executes. The generators live in the `web-search-agent` repo
+(`scripts/inline-search-sources.mjs`, `scripts/bundle-publishers.mjs`), which is also where
+the publisher retrieval modules that `publishers-bundle.js` is generated from live.
+
+**2. `URL.createObjectURL` DOES NOT EXIST in an MV3 service worker.** There is no Blob URL
+store outside a document. Downloads hand `chrome.downloads.download()` a `data:` url built
+from the base64 already in hand. This threw `TypeError` on *every* download for a full day
+because the unit test injected a fake `URL` carrying `createObjectURL` — the stub was testing
+itself. `tests/quick-download.test.mjs` now passes Node's REAL `URL` plus a structural guard.
+
+**3. Listeners must be registered SYNCHRONOUSLY at top level.** `chrome.runtime.onMessage`,
+`onStartup`, `onInstalled`, `alarms.onAlarm`. Registering inside an async callback means the
+worker misses the event that woke it.
+
+**4. The worker is evicted when idle.** All alarms are one-shot and cleared on success, so a
+1-minute heartbeat alarm is what revives it. Do not remove it.
+
+**5. The popup dies the instant it loses focus.** It must never own work. It sends
+`popup_download` and the WORKER runs the retrieval — which can take an hour when a human is
+solving a challenge. The popup's `sendResponse` path returns `true` to keep the channel open.
+
+**6. The popup window's shape is Chrome's, not ours.** `border-radius` on `html`/`body`
+computes correctly and renders square (Chromium bug 40852436). Do not re-attempt it; paint
+edge-to-edge instead so no white notch shows at the corners.
+
+## Retrieval ladder (`retrievePaper`)
+
+Order is load-bearing.
+
+1. **Phase 1 — open access, in parallel:** a direct URL the caller passed, plus Unpaywall,
+   OpenAlex, PubMed Central, CORE. None opens a tab or involves a human.
+   Unpaywall and PMC **require** a contact email and reject requests without one — with no
+   email the entire phase is skipped and every download goes the slow way.
+2. **Phase 2 — publishers, sequential:** ssrn, digitalcommons, mendeley, cell, sciencedirect,
+   nature, springer, wiley, acs, oup. May open a tab; may need the user to clear a challenge.
+3. **Phase 3 — mirrors, LAST:** libgen, annas, scihub. Last so an unsigned mirror copy cannot
+   displace the authentic publisher file — `%PDF-` is a 5-byte sanity check, not integrity.
+   Bounded as a group (`MIRROR_PHASE_BUDGET_MS`), because three sources at 45s each is longer
+   than a user will believe the thing is still working.
+
+A source that fails with a global outage is **parked for 30 minutes** (`parkSource`), so a
+dead domain does not re-cost every subsequent download.
+
+## Tab lifecycle — the rule that matters
+
+`withClearedTab()` owns every tab this extension opens, and `tabsOwnedByAnyCall` prevents one
+call stealing another's tab. **The extension must NEVER close a tab the user opened.** It has
+done so once: `seen` recorded timing, not provenance. Provenance is now opener-chain plus a
+1.5s `HANDOFF_WINDOW_MS` for `target=_blank` handoffs that carry no opener.
+
+`tests/tab-cleanup.test.mjs` encodes all of this, including "a tab of the user's own is NEVER
+closed". Treat a failure there as a real defect, never as a flaky test.
+
+## Credentials and the allowlist
+
+`credentialsFor(url)` is the SINGLE decision point; callers cannot pass credentials, and
+`workerFetch`'s third argument is a boolean that only DOWNGRADES. A structural test forbids
+any `credentials: 'include' | 'omit'` literal at a call site — that shape is what let cookies
+reach hosts with no business seeing them.
+
+`urlTier()` returns CREDENTIALED / ANONYMOUS / NONE. Exact anonymous entries beat
+suffix-matched credentialed grants (`api.ssrn.com` must not receive `ssrn.com`'s cookies).
+
+The allowlist lives in a **byte-identical parity region** in three places:
+`extension/allowlist.js`, inlined into `extension/background.js`, and `src/bridge/allowed-hosts.js`
+in the `web-search-agent` repo. Adding a host means editing all three plus `manifest.json`.
+Tests in web-search-agent enforce that the three stay byte-identical.
+
+## Web Store build — the mirror strip
+
+`node scripts/build-store-package.mjs` produces `dist-store/`. It is a DIFFERENT artifact:
+
+- `key` REMOVED → the Store assigns a different extension ID → the native host's
+  `allowed_origins` must be updated after the first upload, or the published extension cannot
+  reach Corpus Studio at all.
+- Icons required; mirror hosts and mirror CODE removed.
+
+**Deleting `mirror-sources.js` is NOT sufficient** — its functions and hardcoded hostnames are
+inlined into `background.js`, and a package once shipped 12 live sci-hub/libgen references
+while the script believed it had stripped them. Both regions are now fenced with
+`---8<--- mirror ... ---8<---` markers and cut, and the build **greps the finished staging dir
+and refuses to zip** if one reference survives. Never submit a `--with-mirrors` build.
+
+## This repo is not the only copy — THREE trees must be kept in step
+
+Changing `extension/` here is not enough. The same extension exists in two other places, and
+in both cases staleness fails SILENTLY:
+
+1. **`web-search-agent`** (`AI/agents/server/web-search/chrome-extension/`) — where the
+   generators and the publisher retrieval modules live, and where the allowlist parity tests
+   run. Its MCP server drives this extension over the native-messaging socket.
+2. **Corpus Studio** (`resources/paper-bridge/extension/`) — a vendored copy that SHIPS TO
+   USERS. Run `npm run paper-bridge:sync` in that repo after any change here, or the app
+   installs an old extension. The copy is read only at install time, so nothing fails loudly.
+   It has already gone stale once (vendored 1.0.1 with no popup while source was 1.0.2).
+
+## Testing
+
+```bash
+npm test                                   # full suite
+node --test tests/quick-download.test.mjs  # download path
+npm run check                              # syntax-check worker + popup
+```
+
+The tab-safety suite (`tab-cleanup.test.mjs`) lives in the `web-search-agent` repo along with
+the rest of the retrieval tests. Run it there when touching tab lifecycle.
+
+**Do not trust a stubbed browser API.** Trap 2 above passed its unit test for a day. When a
+change touches a `chrome.*` or platform API, verify it in a REAL loaded extension:
+`chromium.launchPersistentContext` with `--load-extension`, then `sw.evaluate()` against the
+actual service worker. That is how the download bug was found, and how the fix was confirmed.
+
+## Files
+
+```
+extension/           WHAT CHROME LOADS — load this dir unpacked
+  background.js      the service worker: ladder, tabs, downloads, allowlist + inlined modules
+  allowlist.js       parity region source (urlTier / credentialsFor)
+  search-sources.js  ssrn, arxiv, pubmed, biorxiv  (inlined into background.js)
+  oa-sources.js      unpaywall, openalex, pmc, core (inlined)
+  mirror-sources.js  libgen, annas, scihub          (inlined; stripped for the store)
+  publishers-bundle.js GENERATED in web-search-agent — never hand-edit
+  popup.{html,css,js}  the toolbar panel
+  fonts/             Instrument Sans + Geist Mono, to match Corpus Studio exactly
+  manifest.json      MV3; `key` pins the dev id; host_permissions must match the allowlist
+scripts/             build-store-package.mjs (the Web Store zip)
+tests/               node --test
+dist-store/          BUILD OUTPUT, gitignored — regenerate with `npm run build`
+```

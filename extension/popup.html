@@ -1,0 +1,48 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>Corpus Retriever</title>
+    <link rel="stylesheet" href="popup.css" />
+  </head>
+  <body>
+    <h1>Corpus Retriever</h1>
+    <p class="note">Save a paper to your Downloads folder.</p>
+
+    <form id="form" autocomplete="off">
+      <input
+        id="identifier"
+        type="text"
+        placeholder="Paste a DOI or paper link"
+        aria-label="DOI, arXiv ID, or a link to the paper"
+        autofocus
+      />
+      <button id="go" type="submit">Download</button>
+    </form>
+
+    <!-- Every state is a sibling, shown one at a time. A status area that swaps its own text
+         made "failed" and "saved" the same element, which is how a stale success survives a
+         later failure. -->
+    <!-- Short, because it is read while waiting. The two facts a waiting person needs are
+         that it may be slow and that they may close the panel; everything else can go. -->
+    <p id="working" class="msg" role="status" hidden>
+      Looking for it&hellip; this can take a minute. You can close this panel.
+    </p>
+    <p id="done" class="msg is-ok" role="status" hidden></p>
+    <p id="failed" class="msg is-error" role="alert" hidden></p>
+    <p id="attempts-label" class="attempts-label" hidden>Where we looked</p>
+    <ul id="attempts" hidden></ul>
+
+    <details id="settings">
+      <summary>Settings</summary>
+      <!-- Unpaywall and PMC both REQUIRE a contact address and refuse placeholders with a
+           422. Without one the open-access half of the ladder is skipped entirely -- so the
+           label says what it BUYS the user, not which APIs demand it. -->
+      <label for="email">Your email <span>&mdash; lets us search free-to-read libraries</span></label>
+      <input id="email" type="email" placeholder="you@university.edu" />
+      <p id="saved" class="msg" hidden>Saved.</p>
+    </details>
+
+    <script src="popup.js"></script>
+  </body>
+</html>

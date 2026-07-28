@@ -1,0 +1,13 @@
+{
+  "name": "corpus-retriever",
+  "version": "1.0.2",
+  "private": true,
+  "type": "module",
+  "description": "Chrome extension that saves academic PDFs to the browser's Downloads folder.",
+  "scripts": {
+    "build": "node scripts/build-store-package.mjs",
+    "build:mirrors": "node scripts/build-store-package.mjs --with-mirrors",
+    "test": "node --test tests/",
+    "check": "node --check extension/background.js && node --check extension/popup.js"
+  }
+}
