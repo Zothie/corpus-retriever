@@ -60,14 +60,18 @@ Where we looked
 That list is the point: it tells you whether the paper is behind a paywall, or simply not
 online anywhere — two very different problems.
 
-## What it does not do
+## What it saves you
 
-**It does not get you past paywalls.** It fetches papers using your own browser session, the
-same as if you clicked through the publisher's website yourself. If you cannot open a paper by
-hand, this cannot open it either.
+The hunting. Checking the free archives, then the publisher, then finding the real PDF link on
+a page designed to hide it — and, when a paper is paywalled, going to the shadow libraries by
+hand.
 
-What it saves you is the hunting: checking four free archives, then the publisher, then
-finding the actual PDF link on a page designed to hide it.
+It tries all of that in one click, in the order most likely to find a legitimate copy first.
+
+**On paywalled papers it does reach Sci-Hub, LibGen and Anna's Archive.** Those host papers
+without the publisher's permission, and downloading from them is copyright infringement in
+most countries. It is a real capability, not a footnote: for a paywalled article, that
+fallback is usually what produces the PDF. Use it knowing that.
 
 ## Privacy
 
@@ -80,11 +84,22 @@ Full policy: <https://zothie.github.io/corpus-studio/privacy.html>
 
 ## Where papers come from
 
-Free archives first, because they are fastest and always readable: **Unpaywall, OpenAlex,
-PubMed Central, CORE**.
+It tries sources in order and stops at the first real PDF.
 
-Then the publishers themselves: **SSRN, DigitalCommons, Mendeley Data, Cell, ScienceDirect,
-Nature, Springer, Wiley, ACS, OUP**.
+**1. Free archives** — fastest, always readable, tried in parallel:
+Unpaywall · OpenAlex · PubMed Central · CORE
+
+**2. Publishers** — using your own browser session:
+SSRN · DigitalCommons · Mendeley Data · Cell · ScienceDirect · Nature · Springer · Wiley ·
+ACS · OUP
+
+**3. Shadow libraries** — LibGen · Anna's Archive · Sci-Hub
+
+These come last on purpose: a mirror copy is unsigned and may be altered or mislabelled, so it
+must never displace the publisher's own file when both exist.
+
+**Search** (used by the desktop integration, not the popup): SSRN · arXiv · PubMed ·
+bioRxiv/medRxiv, with Crossref resolving DOIs to titles.
 
 ---
 
@@ -154,24 +169,24 @@ Three phases, and the order is load-bearing:
 A source failing in a way that looks like a global outage is parked for 30 minutes, so a dead
 domain does not re-cost every later download.
 
-## Building for the Chrome Web Store
+## Packaging a zip
 
 ```bash
-npm run build           # -> dist-store/corpus-retriever-<version>.zip
-npm run build:mirrors   # keeps phase 3, for a build you load unpacked yourself
+npm run build:mirrors   # everything, exactly as this repo runs it
+npm run build           # same, minus phase 3
 ```
 
-The Store build is a **different artifact** from the development copy:
+Both write `dist-store/corpus-retriever-<version>.zip` and drop the manifest `key`, so the
+packaged copy gets a fresh extension ID rather than colliding with an unpacked one.
 
-- `key` is removed, so the Store assigns its own extension ID.
-- **Phase 3 is stripped** — code, hostnames and host permissions. Store policy treats
-  facilitating access to infringing copies as grounds for removal. Deleting
-  `mirror-sources.js` is not sufficient, because its functions are inlined into
-  `background.js`; both regions are fenced and cut, and the build greps the finished staging
-  directory and refuses to produce a zip if one reference survives.
+`npm run build` additionally removes phase 3 — code, hostnames and host permissions.
+Deleting `mirror-sources.js` is **not** sufficient, because its functions are inlined into
+`background.js`; both regions are fenced with `---8<---` markers and cut, and the script greps
+the finished staging directory and refuses to produce a zip if a single reference survives.
+That check exists because an earlier version silently shipped twelve of them.
 
-Bump `"version"` in `extension/manifest.json` before every re-upload — the Store rejects a
-re-upload at the same version.
+Bump `"version"` in `extension/manifest.json` between packages — anywhere you upload will
+reject a re-upload at the same version.
 
 ## Driving it from a desktop application
 
