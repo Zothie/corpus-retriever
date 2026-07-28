@@ -56,13 +56,30 @@ re-upload at the same version.
 
 **Search:** SSRN, arXiv, PubMed, bioRxiv/medRxiv (Crossref resolves DOIs).
 
-**Download:** a direct URL if given, then Unpaywall / OpenAlex / PubMed Central / CORE in
-parallel, then SSRN, DigitalCommons, Mendeley Data, Cell, ScienceDirect, Nature, Springer,
-Wiley, ACS and OUP in sequence.
+**Download** runs as a three-phase ladder, and the order is load-bearing:
+
+1. **Open access, in parallel** — a direct URL if you gave one, plus Unpaywall, OpenAlex,
+   PubMed Central and CORE. Nothing here opens a tab or involves a human.
+2. **Publishers, in sequence** — SSRN, DigitalCommons, Mendeley Data, Cell, ScienceDirect,
+   Nature, Springer, Wiley, ACS, OUP. These may open a tab, and one may ask you to prove you
+   are human.
+3. **Mirrors, last** — LibGen, Anna's Archive, Sci-Hub. Last on purpose: an unsigned mirror
+   copy must not displace the publisher's own file, and the `%PDF-` check is five bytes of
+   sanity, not proof of integrity. The phase is time-boxed as a group so three slow sources
+   cannot make a download look hung.
+
+A source that fails with what looks like a global outage is parked for 30 minutes, so a dead
+domain does not re-cost every later download.
 
 Unpaywall and PubMed Central **require** a contact email and reject requests without one. Set
-it once in the panel's Settings, or the entire open-access phase is skipped and every download
-takes the slow path.
+it once in the panel's Settings, or phase 1 is skipped entirely and every download takes the
+slow path.
+
+> **Mirrors are in this repository and in a development build, but they are stripped from the
+> Chrome Web Store package** — `npm run build` removes the code, the hostnames and the host
+> permissions, and refuses to produce a zip if a single reference survives. Store policy
+> treats facilitating access to infringing copies as grounds for removal. `npm run
+> build:mirrors` keeps them, for a build you load unpacked yourself.
 
 ## Driving it from a desktop app
 
@@ -73,9 +90,9 @@ a paper instead of the user typing into the panel.
 desktop app --unix socket--> src/bridge/paper-bridge-host.js --stdio--> extension
 ```
 
-[Corpus Studio](https://github.com/Zothie/science-search-aggregator) uses this. Nothing about
-the extension depends on it: with no host installed the channel is simply never connected and
-the toolbar panel works normally.
+[Corpus Studio](https://github.com/Zothie/corpus-studio) uses this. Nothing about the
+extension depends on it: with no host installed the channel is simply never connected and the
+toolbar panel works normally.
 
 ## Repository layout
 
@@ -92,3 +109,10 @@ The extension ships **no dependencies** — it is plain MV3 JavaScript. `axios` 
 devDependencies used only by the Node-side resolvers and their tests.
 
 See `CLAUDE.md` for the MV3 constraints that are not guessable from the code.
+
+## Privacy
+
+No analytics, no tracking, no accounts, and no server run by the developer. The identifier you
+paste goes to the paper sources; the PDF goes to your Downloads folder.
+
+Full policy: <https://zothie.github.io/corpus-studio/privacy.html>
