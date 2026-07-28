@@ -290,7 +290,7 @@ const ANONYMOUS_HOSTS = [
   // Google Scholar. Reached with a TAB rather than a fetch -- it has no API, blocks
   // datacenter traffic, and serves consent/captcha interstitials, which is exactly the
   // case this extension exists for: from the user's own logged-in browser on a residential
-  // IP it is an ordinary page. The MCP server needs Puppeteer for it; this does not.
+  // IP it is an ordinary page. A headless fetcher needs Puppeteer for it; this does not.
   'scholar.google.com',
   // The preprint PDFs themselves, which is where searchBiorxiv's pdfUrl points. Granted
   // separately from api.biorxiv.org because they are different hosts and the API host
@@ -522,7 +522,7 @@ async function workerFetch(url, maxBytes, forceAnonymous = false, timeoutMs = FE
  *
  * Deliberately returns NO page text. An earlier version included the first 300 characters
  * of document.body.innerText, which is the content of a page opened with the user's
- * cookies, and it travelled into log lines and back to the MCP caller. Title, byte count
+ * cookies, and it travelled into log lines and back to the caller. Title, byte count
  * and which challenge markers matched are enough to tell a challenge from a paywall from
  * a real article, without reading anything.
  */
@@ -611,7 +611,7 @@ function inPageFetch(url, maxBytes, credentials, timeoutMs) {
  * general DOM-reading primitive aimed at a tab holding the user's session, and
  * the socket is reachable by anything running locally.
  *
- * The .pdf filter is here rather than on the MCP side because it is also the
+ * The .pdf filter is here rather than in the caller because it is also the
  * poll's termination condition, and because leaving it out makes the poll
  * useless: measured on data.mendeley.com, the PRE-hydration HTML already carries
  * a dozen same-origin navigation anchors (/, /about, /faq, ...). All of them are
@@ -620,7 +620,7 @@ function inPageFetch(url, maxBytes, credentials, timeoutMs) {
  * burns cap slots that the real file links then fall off the end of.
  *
  * The extension is the only place that can apply this filter, since it is the
- * only place that sees the DOM. The MCP side re-checks anyway (pickPdfLink).
+ * only place that sees the DOM. The caller re-checks anyway (pickPdfLink).
  *
  * Serialised into the frame by chrome.scripting, so it closes over nothing.
  */
@@ -1350,7 +1350,7 @@ async function fetchPdf({ url, referer }) {
  *
  * Scholar has no API and is the one index that genuinely needs a browser: it blocks
  * datacenter traffic outright and answers consent and captcha interstitials, which is why
- * the MCP server drives it with Puppeteer. From the user's own logged-in Chrome on a
+ * a headless fetcher drives it with Puppeteer. From the user's own logged-in Chrome on a
  * residential IP it is an ordinary page, so a tab plus a DOM read is enough.
  *
  * The selectors are Scholar's long-standing result markup: .gs_ri wraps each result, .gs_rt
@@ -1458,7 +1458,7 @@ async function searchScholar({ query, maxResults = 10, page = 1, filters = {} })
 /**
  * Retrieve one paper, trying every source the extension has.
  *
- * This is what makes the MCP server unnecessary for downloads. It runs the same three-phase
+ * This is what makes the extension self-sufficient for downloads. It runs the same three-phase
  * ladder the server used, with one deliberate change: mirrors go LAST rather than racing in
  * the parallel phase. Mirrors have no bot-check, so in a flat race they routinely beat the
  * publisher and an unsigned mirror copy silently displaces the authentic file -- and %PDF-
@@ -3097,7 +3097,7 @@ const logger = createLogger();
 // the user's own browser at human frequency, so the limiter is a no-op rather than a port.
 const paperRateLimiter = { acquire: async () => {} };
 
-// --- src/tools/doi-path-safety.js ---
+// --- src/publishers/doi-path-safety.js ---
 // Is a DOI safe to paste into a URL path?
 //
 // Springer, Wiley and ACS all address an article by embedding the DOI whole in a path
@@ -3144,7 +3144,7 @@ function isSafeDoiPathSegment(doi) {
   return true;
 }
 
-// --- src/tools/elsevier-pii.js ---
+// --- src/publishers/elsevier-pii.js ---
 // Shared Elsevier PII resolution.
 //
 // Every Elsevier platform addresses an article by its PII, not by its DOI. cell.com,
@@ -3328,7 +3328,7 @@ async function elsevierPii(doi, { resolve = elsevier_pii$resolveViaDoiOrg, signa
   return pii;
 }
 
-// --- src/tools/ssrn-retrieval.js ---
+// --- src/publishers/ssrn-retrieval.js ---
 // SSRN preprints are distributed as DOIs of the form 10.2139/ssrn.<numericId>. The
 // doi.org resolver 302s to www.ssrn.com/abstract=<id>, which itself 302s to the real
 // abstract page papers.ssrn.com/sol3/papers.cfm?abstract_id=<id>. That abstract page is
@@ -3376,7 +3376,7 @@ function ssrnDeliveryUrl(id) {
   return `https://papers.ssrn.com/sol3/Delivery.cfm/SSRN_ID${encoded}.pdf?abstractid=${encoded}&mirid=1`;
 }
 
-// --- src/tools/cell-retrieval.js ---
+// --- src/publishers/cell-retrieval.js ---
 // Cell Press (cell.com) article retrieval through the browser bridge.
 //
 // Why the bridge: all three cell.com PDF URL patterns return 403 to a plain HTTP client
@@ -3709,7 +3709,7 @@ function cellArticlePdfUrl(pii) {
   return `https://www.cell.com/article/${compact}/pdf`;
 }
 
-// --- src/tools/sciencedirect-retrieval.js ---
+// --- src/publishers/sciencedirect-retrieval.js ---
 // ScienceDirect (sciencedirect.com) article retrieval through the browser bridge.
 //
 // Why the bridge: both the article page and the pdfft endpoint return 403 to a plain HTTP
@@ -3993,7 +3993,7 @@ function isPaywallHtml(body) {
   return sciencedirect_retrieval$PAYWALL_MARKERS.some((marker) => text.includes(marker.toLowerCase()));
 }
 
-// --- src/tools/mendeley-retrieval.js ---
+// --- src/publishers/mendeley-retrieval.js ---
 // Mendeley Data (data.mendeley.com) research datasets.
 //
 // WHY THIS NEEDS THE BROWSER BRIDGE, AND WHY IT NEEDS MORE THAN fetch_pdf.
@@ -4067,7 +4067,7 @@ function mendeleyLandingUrl(id) {
   return `https://data.mendeley.com/datasets/${dataset}${version}`;
 }
 
-// --- src/tools/digitalcommons-retrieval.js ---
+// --- src/publishers/digitalcommons-retrieval.js ---
 // DigitalCommons (bepress) institutional repositories.
 //
 // Unlike every other publisher in the registry there is NO DOI pattern here. bepress
@@ -4207,7 +4207,7 @@ function digitalCommonsHosts() {
   return [...digitalcommons_retrieval$INSTANCE_HOSTS];
 }
 
-// --- src/tools/nature-retrieval.js ---
+// --- src/publishers/nature-retrieval.js ---
 // Springer Nature (nature.com).
 //
 // Measured 2026-07-26:
@@ -4254,7 +4254,7 @@ function naturePdfUrl(id) {
   return `https://www.nature.com/articles/${id}.pdf`;
 }
 
-// --- src/tools/springer-retrieval.js ---
+// --- src/publishers/springer-retrieval.js ---
 // Springer (link.springer.com).
 //
 // Measured 2026-07-26:
@@ -4312,7 +4312,7 @@ function springerPdfUrl(id) {
   return `https://link.springer.com/content/pdf/${id}.pdf`;
 }
 
-// --- src/tools/wiley-retrieval.js ---
+// --- src/publishers/wiley-retrieval.js ---
 // Wiley (onlinelibrary.wiley.com).
 //
 // Measured 2026-07-26:
@@ -4372,7 +4372,7 @@ function wileyPdfUrl(id) {
   return `https://onlinelibrary.wiley.com/doi/pdfdirect/${id}`;
 }
 
-// --- src/tools/acs-retrieval.js ---
+// --- src/publishers/acs-retrieval.js ---
 // American Chemical Society (pubs.acs.org).
 //
 // Measured 2026-07-26:
@@ -4437,7 +4437,7 @@ function acsLandingUrl(id) {
  */
 const ACS_PDF_LINK = /\/article-pdf\/doi\//;
 
-// --- src/tools/oup-retrieval.js ---
+// --- src/publishers/oup-retrieval.js ---
 // Oxford University Press (academic.oup.com).
 //
 // Measured 2026-07-26:
@@ -4582,10 +4582,10 @@ function oupLandingUrl(id) {
   return `https://academic.oup.com/${id}`;
 }
 
-// --- src/tools/publishers.js ---
+// --- src/publishers/publishers.js ---
 // Declarative registry of publishers served by the browser bridge.
 //
-// The bridge transport (extension -> native host -> unix socket -> MCP) is already
+// The bridge transport (extension -> native host -> unix socket -> desktop client) is already
 // publisher-agnostic: it takes {url, referer} and returns PDF bytes fetched from inside
 // the user's real Chrome. What was publisher-specific was the resolver branch in
 // save-to-vault.js. This module turns that branch into data: each entry says which

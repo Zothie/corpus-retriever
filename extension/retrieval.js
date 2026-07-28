@@ -1,6 +1,6 @@
 // Retrieval, run entirely inside the extension.
 //
-// This is the piece that makes the MCP server unnecessary. Until now the extension resolved
+// This is the piece that makes the extension self-sufficient. It used to resolve
 // and fetched for TEN publishers while the server still owned everything else -- the OA
 // APIs, the mirrors, and the two-phase race that decides between them. Corpus Studio
 // therefore still needed the server running to download anything that was not one of those

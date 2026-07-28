@@ -1,16 +1,97 @@
-// Host allowlist and credential tiers for the browser bridge -- the EXTENSION's copy.
-//
-// Byte-identical to the region between the same markers in src/bridge/allowed-hosts.js,
-// apart from the `export` keywords this file needs. tests/allowed-hosts.test.mjs and
-// tests/url-tier.test.mjs extract this region, evaluate it standalone, and run the same
-// adversarial vector table through both copies, so drift is a test failure rather than a
-// silent security hole. Edit both or neither.
-//
-// The rationale for the two grant shapes, for why DigitalCommons is an explicit host list
-// instead of an open .edu pattern, and for why the credential tier is derived from the url
-// rather than chosen by the caller, all live in the header of src/bridge/allowed-hosts.js.
-// Do not restate it here; it would drift.
+/**
+ * Host allowlist for the browser bridge.
+ *
+ * The unix socket is the trust boundary: any local process that reaches it can
+ * make requests carrying the user's real cookies. This list is what stops that
+ * from being a general "fetch any URL as me" primitive, so keep it narrow.
+ *
+ * There are two grants, deliberately different in shape:
+ *
+ *   ALLOWED_HOSTS           -- suffix-matched host, any path. For publishers we
+ *                              own the whole hostname relationship with.
+ *   PATH_CONSTRAINED_HOSTS  -- exact host, and only the paths listed. For hosts
+ *                              that are somebody else's infrastructure (a
+ *                              university running a bepress instance) where we
+ *                              want one endpoint, not the site.
+ *
+ * This list is hand-maintained on purpose and must NOT be derived from
+ * src/tools/publishers.js. Deriving it would mean any registry edit silently
+ * widens the credentialed-fetch grant; the intended direction is the reverse,
+ * with a test asserting registry hosts are a SUBSET of what is granted here.
+ *
+ * Adding a host means editing here AND the verbatim copy in the extension's
+ * background.js -- deliberately two explicit steps. The block between the
+ * "allowlist parity" markers below is byte-identical to the extension's copy
+ * apart from the `export ` keywords, and tests/allowed-hosts.test.mjs extracts
+ * the extension's block, evaluates it and runs the same vector table through
+ * both. Drift is a test failure, not a silent hole.
+ *
+ * ---------------------------------------------------------------------------
+ * DigitalCommons: why PATH_CONSTRAINED_HOSTS is an explicit list, not a pattern
+ * ---------------------------------------------------------------------------
+ *
+ * DigitalCommons/bepress instances live on arbitrary university domains
+ * (digitalcommons.unl.edu, scholarworks.uni.edu, hundreds more, plus non-.edu
+ * ones abroad). The tempting rule is an open pattern such as
+ * /^[a-z0-9-]+\.(edu|ac\.[a-z]{2})$/ narrowed by a bepress path. It was
+ * rejected.
+ *
+ * The attacker model is "a local process reached the socket", so the attacker
+ * chooses the host. Under an open .edu rule the path constraint buys much less
+ * than it looks like it does:
+ *
+ *   - evil.edu/wp-admin is refused by the path rule, but
+ *   - evil.edu/cgi/viewcontent.cgi is not, and an attacker who controls the
+ *     host trivially serves a body starting with "%PDF-", which is the only
+ *     content check downstream. A path rule cannot constrain a host the
+ *     attacker owns.
+ *
+ * Against a host the attacker merely registered, what they gain is small: the
+ * fetch carries cookies for the TARGET host, and the user has no session with
+ * evil.edu. The real cost is that the same rule also grants every *genuine*
+ * university host -- library proxies, ILS and repository front-ends, VPN- or
+ * IP-gated resources, intranet names that only resolve on campus. Those are
+ * hosts the user does have sessions with, they are reachable because the fetch
+ * runs inside the user's browser and network, and their authenticated responses
+ * are very often legitimately PDFs, so the "%PDF-" check filters nothing there
+ * either. An open .edu set turns the bridge into "fetch any PDF from any
+ * university as the user, from inside their perimeter". That is far larger than
+ * the handful of repositories we actually want, and avoiding list maintenance
+ * does not justify it.
+ *
+ * Also rejected: "the URL came from web_fulltext_* discovery, not from a DOI, so
+ * it is not attacker-chosen." The trust boundary is the socket, and whatever
+ * reaches it supplies the URL directly. Neither the native host nor the
+ * extension can tell a discovered URL from an invented one; making that real
+ * would need signed or nonce-bound requests, which this transport does not
+ * have. Provenance is not a security control here.
+ *
+ * The cost is stated honestly: coverage is incomplete. Only the instances listed
+ * work; every other bepress repository is a failed download until someone adds
+ * it. That is the intended trade -- a missing repository is an inconvenience, a
+ * wildcard is a credentialed fetch primitive over an entire sector. The list was
+ * populated in Task 4 from instances verified live to serve bepress; adding one
+ * is a deliberate two-file edit, which is the point.
+ *
+ * Path rules: an entry ending in "/" is a prefix match, anything else must equal
+ * the pathname exactly. Exact matching stops "/cgi/viewcontent.cgi.evil" from
+ * riding in on a prefix test. Host matching is exact, with no subdomain suffix,
+ * because these are third-party names we have no authority over.
+ */
 
+// Publisher object-storage hosts are deliberately ABSENT here even though the manifest
+// grants them. Mendeley hands its downloads off to S3 by redirect, OUP and ACS hand theirs
+// to watermark02.silverchair.com, and the allowlist governs what we ASK for, not where a
+// publisher forwards us -- the redirect is followed inside a single fetch, so the storage
+// URL is never a request this code originates. Granting them here would let anything
+// reaching the socket fetch arbitrary objects from those origins directly, which is a much
+// larger permission than following one publisher's handoff.
+//
+// The manifest DOES need each handoff host, because Chrome checks host_permissions on
+// every hop. A missing one surfaces as an opaque "TypeError: Failed to fetch" with the
+// real cause only in the probe ("Extension manifest must request permission to access this
+// host"), which is how silverchair.com was found. So: handoff hosts go in the manifest and
+// nowhere else.
 // ---8<--- allowlist parity region ---8<---
 export const ALLOWED_HOSTS = [
   'ssrn.com',
@@ -336,4 +417,3 @@ export function isAllowedNavigationUrl(url) {
   if (!/^[a-z0-9-]+(\.[a-z0-9-]+)*$/.test(host)) return false;
   return PATH_CONSTRAINED_HOSTS.some((r) => host === r.host);
 }
-

@@ -64,10 +64,31 @@ Unpaywall and PubMed Central **require** a contact email and reject requests wit
 it once in the panel's Settings, or the entire open-access phase is skipped and every download
 takes the slow path.
 
-## Related
+## Driving it from a desktop app
 
-The retrieval logic is shared with the `web-search-agent` MCP server, and
-[Corpus Studio](https://github.com/Zothie/science-search-aggregator) drives this extension
-over Chrome's native messaging to retrieve papers from the desktop app.
+The extension also answers over Chrome's native messaging, so a local application can request
+a paper instead of the user typing into the panel.
+
+```
+desktop app --unix socket--> src/bridge/paper-bridge-host.js --stdio--> extension
+```
+
+[Corpus Studio](https://github.com/Zothie/science-search-aggregator) uses this. Nothing about
+the extension depends on it: with no host installed the channel is simply never connected and
+the toolbar panel works normally.
+
+## Repository layout
+
+```
+extension/     the extension itself — load THIS unpacked
+src/publishers/  the publisher resolvers, in Node form; extension/publishers-bundle.js
+                 is GENERATED from them by scripts/bundle-publishers.mjs
+src/bridge/    the native-messaging host, and the allowlist it shares with the extension
+scripts/       bundle-publishers, inline-search-sources, build-store-package
+tests/         node --test
+```
+
+The extension ships **no dependencies** — it is plain MV3 JavaScript. `axios` and `xml2js` are
+devDependencies used only by the Node-side resolvers and their tests.
 
 See `CLAUDE.md` for the MV3 constraints that are not guessable from the code.

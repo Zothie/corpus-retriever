@@ -30,12 +30,19 @@ A static import breaks worker registration; a dynamic `import()` throws at runti
 the worker *silently*.
 
 The sibling files (`search-sources.js`, `oa-sources.js`, `mirror-sources.js`,
-`publishers-bundle.js`) are therefore INLINED into `background.js` — they are kept alongside
-it as readable sources and as test fixtures, but the worker uses only its own inlined copies.
-**Editing a sibling alone changes nothing at runtime**; the inlined region in `background.js`
-is what executes. The generators live in the `web-search-agent` repo
-(`scripts/inline-search-sources.mjs`, `scripts/bundle-publishers.mjs`), which is also where
-the publisher retrieval modules that `publishers-bundle.js` is generated from live.
+`publishers-bundle.js`) are therefore INLINED into `background.js`. **Editing a sibling alone
+changes nothing at runtime** — the inlined region in `background.js` is what executes.
+
+Two generators, both in `scripts/`:
+
+```bash
+node scripts/bundle-publishers.mjs      # src/publishers/*-retrieval.js -> extension/publishers-bundle.js
+node scripts/inline-search-sources.mjs  # the four siblings -> into extension/background.js
+```
+
+`publishers-bundle.js` is itself GENERATED from `src/publishers/*-retrieval.js`, which are
+ordinary Node modules (they may import axios; the bundler strips and shims those). So a
+publisher change is: edit `src/publishers/`, run BOTH generators, reload the extension.
 
 **2. `URL.createObjectURL` DOES NOT EXIST in an MV3 service worker.** There is no Blob URL
 store outside a document. Downloads hand `chrome.downloads.download()` a `data:` url built
@@ -97,9 +104,12 @@ reach hosts with no business seeing them.
 suffix-matched credentialed grants (`api.ssrn.com` must not receive `ssrn.com`'s cookies).
 
 The allowlist lives in a **byte-identical parity region** in three places:
-`extension/allowlist.js`, inlined into `extension/background.js`, and `src/bridge/allowed-hosts.js`
-in the `web-search-agent` repo. Adding a host means editing all three plus `manifest.json`.
-Tests in web-search-agent enforce that the three stay byte-identical.
+`extension/allowlist.js`, inlined into `extension/background.js`, and
+`src/bridge/allowed-hosts.js` (the host's own copy — it re-validates every URL, because a
+compromised or stale extension must not be able to hand it an arbitrary target).
+
+Adding a host means editing all three plus `extension/manifest.json`. `tests/allowed-hosts.test.mjs`
+and `tests/url-tier.test.mjs` enforce that they stay in step.
 
 ## Web Store build — the mirror strip
 
@@ -116,29 +126,23 @@ while the script believed it had stripped them. Both regions are now fenced with
 `---8<--- mirror ... ---8<---` markers and cut, and the build **greps the finished staging dir
 and refuses to zip** if one reference survives. Never submit a `--with-mirrors` build.
 
-## This repo is not the only copy — THREE trees must be kept in step
+## This repo is the source of truth — but it is not the only copy
 
-Changing `extension/` here is not enough. The same extension exists in two other places, and
-in both cases staleness fails SILENTLY:
+Corpus Studio ships a VENDORED copy at `resources/paper-bridge/extension/`. After any change
+here, run `npm run paper-bridge:sync` in that repo, or the app installs an old extension.
 
-1. **`web-search-agent`** (`AI/agents/server/web-search/chrome-extension/`) — where the
-   generators and the publisher retrieval modules live, and where the allowlist parity tests
-   run. Its MCP server drives this extension over the native-messaging socket.
-2. **Corpus Studio** (`resources/paper-bridge/extension/`) — a vendored copy that SHIPS TO
-   USERS. Run `npm run paper-bridge:sync` in that repo after any change here, or the app
-   installs an old extension. The copy is read only at install time, so nothing fails loudly.
-   It has already gone stale once (vendored 1.0.1 with no popup while source was 1.0.2).
+That staleness fails SILENTLY — the vendored tree is read only at install time, so nothing
+errors. It has already gone stale once: vendored 1.0.1 with no popup at all, while this repo
+was on 1.0.2.
 
 ## Testing
 
 ```bash
-npm test                                   # full suite
+npm test                                   # full suite (92)
 node --test tests/quick-download.test.mjs  # download path
+node --test tests/tab-cleanup.test.mjs     # tab safety — never dismiss a failure here
 npm run check                              # syntax-check worker + popup
 ```
-
-The tab-safety suite (`tab-cleanup.test.mjs`) lives in the `web-search-agent` repo along with
-the rest of the retrieval tests. Run it there when touching tab lifecycle.
 
 **Do not trust a stubbed browser API.** Trap 2 above passed its unit test for a day. When a
 change touches a `chrome.*` or platform API, verify it in a REAL loaded extension:
@@ -154,11 +158,21 @@ extension/           WHAT CHROME LOADS — load this dir unpacked
   search-sources.js  ssrn, arxiv, pubmed, biorxiv  (inlined into background.js)
   oa-sources.js      unpaywall, openalex, pmc, core (inlined)
   mirror-sources.js  libgen, annas, scihub          (inlined; stripped for the store)
-  publishers-bundle.js GENERATED in web-search-agent — never hand-edit
+  publishers-bundle.js GENERATED from src/publishers/ — never hand-edit
   popup.{html,css,js}  the toolbar panel
   fonts/             Instrument Sans + Geist Mono, to match Corpus Studio exactly
   manifest.json      MV3; `key` pins the dev id; host_permissions must match the allowlist
-scripts/             build-store-package.mjs (the Web Store zip)
+
+src/publishers/      the resolvers in Node form, and the SOURCE of publishers-bundle.js
+src/bridge/
+  paper-bridge-host.js  native-messaging host: unix socket <-> extension stdio
+  allowed-hosts.js      the host's own allowlist copy; re-validates every URL
+src/utils/           logger + the per-source rate limiter for the public academic APIs
+
+scripts/             bundle-publishers, inline-search-sources, build-store-package
 tests/               node --test
 dist-store/          BUILD OUTPUT, gitignored — regenerate with `npm run build`
 ```
+
+The extension ships NO dependencies. `axios`/`xml2js` are devDependencies of the Node-side
+resolvers only; the bundler strips those imports on the way into `publishers-bundle.js`.
