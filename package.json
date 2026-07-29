@@ -8,9 +8,11 @@
     "build": "node scripts/build-store-package.mjs",
     "build:mirrors": "node scripts/build-store-package.mjs --with-mirrors",
     "test": "node --test tests/",
+    "vendor:qpdf": "node scripts/vendor-qpdf.mjs",
     "check": "node --check extension/background.js && node --check extension/popup.js"
   },
   "devDependencies": {
+    "@neslinesli93/qpdf-wasm": "^0.3.0",
     "axios": "^1.7.7",
     "xml2js": "^0.6.2"
   }
