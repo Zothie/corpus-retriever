@@ -45,6 +45,10 @@ Paste and click **Download**.
 - **You can close the panel while it works.** The download keeps going.
 - **A tab may open asking you to confirm you are human.** That is the publisher's check, not
   ours. Clear it and the download continues by itself.
+- **The saved file is optimised before it lands.** Publisher PDFs carry a lot of dead weight;
+  the extension runs qpdf over each download, so what reaches your Downloads folder is usually
+  smaller than what was served. If the optimisation cannot improve it, you get the original
+  bytes untouched — it never costs you the paper.
 
 When it works, you get the filename and where it came from. When it does not, you get a plain
 reason and a short list of everywhere it looked:
@@ -147,7 +151,7 @@ The extension itself ships **no dependencies** — it is plain MV3 JavaScript. `
 `xml2js` are devDependencies of the Node-side resolvers and their tests only.
 
 ```bash
-npm test        # 97 tests
+npm test        # 132 tests
 npm run check   # syntax-check the worker and the popup
 ```
 
