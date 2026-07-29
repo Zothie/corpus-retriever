@@ -119,7 +119,12 @@ if (skip) console.log(`(skipping: ${skip.join(', ')})`);
 
 const t0 = Date.now();
 const r = await sendRetrying({
-  kind: 'retrieve', doi, email: 'corpus-retriever-test@example.com', only, skip,
+  // Unpaywall and PMC REJECT placeholder domains (example.com gets a 422), so a hardcoded
+  // fake address silently removes two sources from every test run -- which read as "the
+  // filter is broken" rather than "the email was refused". Set CONTACT_EMAIL to a real
+  // address to exercise them; without it those two sources are skipped, as they would be
+  // for a user who has not filled the setting in.
+  kind: 'retrieve', doi, email: process.env.CONTACT_EMAIL, only, skip,
 });
 console.log(`\n### ${doi} :: ${r.ok ? `OK ${r.source}` : 'FAIL'} in ${((Date.now() - t0) / 1000).toFixed(1)}s\n`);
 

@@ -33,15 +33,6 @@
     <p id="attempts-label" class="attempts-label" hidden>Where we looked</p>
     <ul id="attempts" hidden></ul>
 
-    <details id="settings">
-      <summary>Settings</summary>
-      <!-- Unpaywall and PMC both REQUIRE a contact address and refuse placeholders with a
-           422. Without one the open-access half of the ladder is skipped entirely -- so the
-           label says what it BUYS the user, not which APIs demand it. -->
-      <label for="email">Your email <span>&mdash; lets us search free-to-read libraries</span></label>
-      <input id="email" type="email" placeholder="you@university.edu" />
-      <p id="saved" class="msg" hidden>Saved.</p>
-    </details>
 
     <script src="popup.js"></script>
   </body>

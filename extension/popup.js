@@ -17,8 +17,6 @@ const done = $('done');
 const failed = $('failed');
 const attempts = $('attempts');
 const attemptsLabel = $('attempts-label');
-const email = $('email');
-const saved = $('saved');
 
 /** Only one state is ever visible; a status line that accumulates is a status line that lies. */
 function show(which, text) {
@@ -87,39 +85,6 @@ function humanSize(bytes) {
     : ` (${Math.round(bytes / 1024)} KB)`;
 }
 
-// The contact address the open-access APIs require. Persisted in sync storage so it survives
-// a reload and follows the profile -- without it Unpaywall and PMC are skipped entirely and
-// the ladder silently loses its cheapest rungs.
-//
-// Hidden once it is set. It is answered once and never again, so leaving it on screen would
-// spend the panel's only vertical space on a solved problem. It reappears only if the value
-// is cleared, which is the one moment it becomes actionable again.
-const settings = $('settings');
-
-function syncSettingsVisibility() {
-  const has = email.value.trim() !== '';
-  settings.hidden = has;
-  if (!has) settings.open = true;
-}
-
-chrome.storage.sync.get({ email: '' }).then(({ email: stored }) => {
-  email.value = stored;
-  syncSettingsVisibility();
-});
-
-let saveTimer = null;
-email.addEventListener('input', () => {
-  clearTimeout(saveTimer);
-  saveTimer = setTimeout(async () => {
-    await chrome.storage.sync.set({ email: email.value.trim() });
-    saved.hidden = false;
-    setTimeout(() => { saved.hidden = true; }, 1500);
-  }, 400);
-});
-
-// Collapsed on BLUR, not on input: hiding the field the moment it holds a plausible address
-// would snatch it away mid-word, and half a typed email is worse than none.
-email.addEventListener('blur', syncSettingsVisibility);
 
 form.addEventListener('submit', async (e) => {
   e.preventDefault();
@@ -135,7 +100,6 @@ form.addEventListener('submit', async (e) => {
     reply = await chrome.runtime.sendMessage({
       type: 'popup_download',
       identifier,
-      email: email.value.trim() || undefined,
     });
   } catch (err) {
     // The worker was evicted or is starting up. Chrome revives it on the next message, so

@@ -859,7 +859,18 @@ function inPageFetchAsBase64(target, maxBytes) {
       const bytes = new Uint8Array(buf);
       if (bytes.length < 5) return { ok: false, error: 'too short' };
       const magic = String.fromCharCode(...bytes.subarray(0, 5));
-      if (magic !== '%PDF-') return { ok: false, error: `not a pdf (${JSON.stringify(magic)})` };
+      if (magic !== '%PDF-') {
+        // A CHALLENGE page is not the same failure as a wrong url, and only the first is
+        // worth a tab. Measured on PubMed Central: it answers a worker fetch with a Google
+        // reCAPTCHA interstitial, which the caller cannot solve but the user can.
+        const head = new TextDecoder().decode(new Uint8Array(buf, 0, Math.min(4096, buf.byteLength)));
+        const challenged = CHALLENGE_MARKERS.test(head);
+        return {
+          ok: false,
+          challenged,
+          error: `not a pdf (${JSON.stringify(magic)})${challenged ? ' -- challenge page' : ''}`,
+        };
+      }
       let bin = '';
       for (let i = 0; i < bytes.length; i += 0x8000) {
         bin += String.fromCharCode.apply(null, bytes.subarray(i, i + 0x8000));
@@ -1036,7 +1047,28 @@ function pageIsCleared(expectedOrigin) {
   // sets it: it survives on the page the WAF just cleared, so treating it as "challenge
   // running" left a solved bepress page looking permanently blocked and the wait never
   // ended. The challenge UI below is the reliable signal.
-  if ('gokuProps' in window) return 'challenge:waf-goku';
+  // Every other challenge vendor, by the DOM it injects. Runs in the page, so it cannot share
+  // the worker's CHALLENGE_MARKERS constant -- but it must recognise the same set, or a
+  // captcha that stops a fetch is one the tab silently fails to surface. That mismatch is
+  // how PubMed Central failed: the fetch saw a reCAPTCHA, reported "not a pdf", and no tab
+  // ever opened for the user to solve it.
+  //
+  // Selectors, not body text: a marker that also matches an article page mentioning
+  // "captcha" would drop papers the source actually has.
+  if (document.querySelector([
+    'base[href*="recaptcha"], iframe[src*="recaptcha"], .g-recaptcha, #g-recaptcha',
+    'iframe[src*="hcaptcha"], .h-captcha',
+    'iframe[src*="arkoselabs"], #arkose, [id*="funcaptcha"]',
+    'iframe[src*="geetest"], .geetest_panel, #geetest',
+    'iframe[src*="datadome"], #datadome, [id^="ddm-"]',
+    'iframe[src*="perimeterx"], #px-captcha, .px-block',
+    'script[src*="kasada"], #kpsdk-challenge',
+    '.frc-captcha, .mtcaptcha, #mtcaptcha',
+    'iframe[src*="incapsula"], #main-iframe[src*="_Incapsula_"]',
+  ].join(', '))) {
+    return 'challenge:captcha';
+  }
+  if ('gokuProps' in window || 'awsWafCookieDomainList' in window) return 'challenge:waf-goku';
   if (document.querySelector('#challenge-container')) return 'challenge:waf';
   // AWS WAF's INTERACTIVE captcha ("Let's confirm you are human"). It replaces the silent
   // token flow with a puzzle, and carries none of the markers above -- no gokuProps, no
@@ -2232,6 +2264,11 @@ async function downloadToBrowser(base64, filename) {
  */
 async function runDownload(request) {
   try {
+    // Fill in the contact address if the caller did not supply one. Doing it HERE rather
+    // than at each call site is the same reason runDownload exists at all: the popup and the
+    // bridge must behave identically, and an address that appears on one path and not the
+    // other would silently drop Unpaywall and PMC from half the downloads.
+    if (!request.email) request = { ...request, email: await contactEmail() };
     // Retrieval and the title lookup run CONCURRENTLY. Retrieval is the slow half (seconds,
     // or a minute through the publisher phase), so the metadata request alongside it is
     // free -- sequentially it would tax every download.
@@ -2320,7 +2357,79 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
   return true;
 });
 
+/**
+ * A stable, anonymous contact address for this INSTALL.
+ *
+ * Unpaywall and PubMed Central give free API access on one condition: every request carries a
+ * contact address, which is how they attribute load and throttle whoever is hammering them.
+ * That condition is reasonable and this honours it -- what it does not do is make the user
+ * type their personal email into a browser extension to read papers.
+ *
+ * The local part is a RANDOM UUID generated once and kept in chrome.storage.local. It is
+ * deliberately NOT a browser fingerprint: a fingerprint is derived from a small space (user
+ * agent, screen, fonts) so hashing it is reversible by brute force, and it would correlate
+ * the same user across unrelated services. A random id identifies the install to the API and
+ * nothing else about the person -- which is exactly as much as the API needs.
+ *
+ * Stable across runs on purpose. A fresh address per request would be indistinguishable from
+ * evading the rate limit, and would leave these services unable to throttle one bad actor
+ * without blocking every user of this extension.
+ */
+// UNREGISTERED as of 2026-07-30 -- checked, no MX and no A record -- so mail sent here is
+// not delivered anywhere. That is a real limitation, not a detail: Unpaywall asks for a
+// contact address so they can REACH whoever is generating load, and an undeliverable one
+// honours the letter of that and not the spirit.
+//
+// It is used anyway because the alternative is worse: a shared hardcoded personal address
+// makes every install indistinguishable, so one abuser gets all users blocked, and asking
+// each user to type their own is the friction this replaces. The random local part at least
+// lets these services attribute and throttle ONE install without touching the rest.
+//
+// If this extension is ever published, register the domain and point it at a mailbox someone
+// reads. Until then this is a stopgap with a known gap.
+const CONTACT_DOMAIN = 'corpusretriever.org';
+
+/**
+ * Short and email-shaped: `word.word37@domain`. A 32-character hex string is a machine id
+ * wearing an address; this reads like an address while carrying the same amount of
+ * information -- ~1.4 million combinations, which is far more than the number of installs and
+ * still says nothing about the person.
+ */
+const CONTACT_WORDS = [
+  'ada', 'bell', 'bohr', 'byron', 'cori', 'curie', 'dalton', 'darwin', 'dirac', 'euler',
+  'fermi', 'floyd', 'franklin', 'gauss', 'gibbs', 'hertz', 'hodgkin', 'hooke', 'hopper',
+  'joule', 'kepler', 'knuth', 'lamarr', 'leakey', 'lovelace', 'mendel', 'newton', 'noether',
+  'ohm', 'pascal', 'pauling', 'planck', 'raman', 'rosalind', 'rutherford', 'sanger',
+  'shannon', 'tesla', 'turing', 'volta', 'watson', 'wu', 'yalow', 'yonath',
+];
+
+async function contactEmail() {
+  try {
+    const got = await chrome.storage.local.get({ contactId: '' });
+    let id = got && got.contactId;
+    if (!id) {
+      // crypto.getRandomValues, not Math.random: the id is the only thing distinguishing one
+      // install from another, and two installs colliding would make them share a rate limit.
+      const r = new Uint32Array(3);
+      crypto.getRandomValues(r);
+      const a = CONTACT_WORDS[r[0] % CONTACT_WORDS.length];
+      const b = CONTACT_WORDS[r[1] % CONTACT_WORDS.length];
+      id = `${a}.${b}${r[2] % 100}`;
+      await chrome.storage.local.set({ contactId: id });
+    }
+    return `${id}@${CONTACT_DOMAIN}`;
+  } catch {
+    // Storage unavailable: the OA sources that require an address are skipped, which is the
+    // documented degraded state rather than an error.
+    return undefined;
+  }
+}
+
 async function retrievePaper({ doi, pdfUrl, email, coreApiKey, only, skip }) {
+  // One retrieval, one trace. Without this the log accumulates across runs and a previous
+  // run's RESULT line reads as this one's answer -- which is exactly the kind of confusion
+  // this logging exists to prevent.
+  devReset();
   // Which sources may run. `only` is a whitelist, `skip` a blacklist; both name sources the
   // way the ladder does ('unpaywall', 'scihub', 'annas', 'libgen', publisher names...).
   // Exists so a run can be aimed at ONE source instead of hunting for a DOI that happens to
@@ -2382,7 +2491,9 @@ async function retrievePaper({ doi, pdfUrl, email, coreApiKey, only, skip }) {
     // Carry the failure with the CANDIDATE. Looking it up in `attempts` afterwards matched
     // whichever entry that source pushed first -- PMC's "not a pdf" masked the refusals the
     // retry below actually exists for, so the retry never ran.
-    return r.ok ? { ...c, buf: r.buf } : { ...c, failed: r.error || 'unknown' };
+    return r.ok
+      ? { ...c, buf: r.buf }
+      : { ...c, failed: r.error || 'unknown', challenged: r.challenged === true };
   }));
   const oaWin = raced.find((r) => r && r.buf);
 
@@ -2405,11 +2516,24 @@ async function retrievePaper({ doi, pdfUrl, email, coreApiKey, only, skip }) {
   if (!oaWin) {
     for (const c of raced) {
       if (!c || !c.failed) continue;
-      // Only a REFUSAL is retried. A 404 or an html body is a real answer, and opening a tab
-      // for those would be the tab spam this file spends most of its length preventing.
-      if (!/Failed to fetch|host not allowlisted/i.test(c.failed)) continue;
+      // A refusal, or a CHALLENGE. A 404 or an ordinary html body is a real answer and gets
+      // no tab -- that restraint is what keeps this from becoming the tab spam most of this
+      // file exists to prevent.
+      //
+      // A challenge is different in kind: the source HAS the paper and is asking whether a
+      // human is present. Measured on PubMed Central, which answers a worker fetch with a
+      // Google reCAPTCHA. Reporting "not a pdf" and moving on hides the one question the
+      // user could actually answer, so the tab is opened and waitForTabCleared surfaces it.
+      const challenged = c.challenged === true || /challenge page/i.test(c.failed);
+      if (!challenged && !/Failed to fetch|host not allowlisted/i.test(c.failed)) continue;
+      if (challenged) devDecide(c.source, 'surface', 'a human is being asked for', { url: c.url });
       devStart(`oa-tab:${c.source}`);
-      const viaTab = await fetchPdf({ url: c.url, budgetMs: OA_TAB_BUDGET_MS });
+      // A challenged source gets the human budget: the user has to see it, read it and
+      // answer it, and twenty seconds is not that. An unreachable host still gets twenty.
+      const viaTab = await fetchPdf({
+        url: c.url,
+        budgetMs: challenged ? HUMAN_SOLVE_BUDGET_MS : OA_TAB_BUDGET_MS,
+      });
       devEnd(`oa-tab:${c.source}`, { ok: Boolean(viaTab.ok) });
       if (viaTab.ok && viaTab.base64) {
         return {
@@ -2746,6 +2870,41 @@ async function retrievePaper({ doi, pdfUrl, email, coreApiKey, only, skip }) {
   return { ok: false, error: 'no source produced a valid pdf', attempts };
 }
 
+/**
+ * Every challenge vendor seen in the wild, as markers that survive a raw-bytes sniff.
+ *
+ * ONE list, shared by the byte check and the in-page detector, so a captcha that stops a
+ * fetch cannot be one the tab fails to recognise -- that mismatch is how PubMed Central came
+ * to fail silently: the fetch saw a reCAPTCHA and reported "not a pdf", and nothing ever
+ * opened a tab where the user could solve it.
+ *
+ * Matched against the first few KB only. These strings appear in the HEAD of an interstitial
+ * (script src, base href, widget container), while an article page that merely mentions
+ * "captcha" in its text does so far below -- and a marker that fires on a good page silently
+ * loses papers, which is worse than the bug it fixes.
+ */
+const CHALLENGE_MARKERS = new RegExp([
+  'recaptcha',                       // Google reCAPTCHA v2/v3 -- PubMed Central
+  'hcaptcha',                        // hCaptcha
+  'turnstile',                       // Cloudflare Turnstile
+  'cf-browser-verification',         // Cloudflare interstitial
+  'cf_chl_opt|cdn-cgi/challenge',    // Cloudflare managed challenge
+  'just a moment|attention required',// Cloudflare, English wording
+  'checking your browser',           // Cloudflare / DDoS-Guard
+  'ddos-guard',                      // DDoS-Guard
+  'altcha',                          // ALTCHA proof-of-work -- Sci-Hub
+  'gokuprops|awswaf',                // AWS WAF
+  'incapsula|_incap_|imperva',       // Imperva / Incapsula
+  'perimeterx|px-captcha|human-challenge', // PerimeterX / HUMAN
+  'datadome',                        // DataDome
+  'kasada|kpsdk',                    // Kasada
+  'geetest',                         // GeeTest
+  'funcaptcha|arkoselabs',           // Arkose Labs
+  'friendlycaptcha',                 // Friendly Captcha
+  'mtcaptcha',                       // MTCaptcha
+  'проверка на робота|вы робот',     // Sci-Hub, Russian
+].join('|'), 'i');
+
 /** Fetch a url and accept it only if the bytes really are a pdf. Never throws. */
 async function fetchValidatedPdf(url, { timeoutMs = 25000 } = {}) {
   const credentials = credentialsFor(url);
@@ -2761,7 +2920,21 @@ async function fetchValidatedPdf(url, { timeoutMs = 25000 } = {}) {
     if (buf.byteLength > MAX_PDF_BYTES) return { ok: false, error: 'too large' };
     if (buf.byteLength < 5) return { ok: false, error: `too short (${buf.byteLength})` };
     const magic = new TextDecoder().decode(new Uint8Array(buf, 0, 5));
-    if (magic !== '%PDF-') return { ok: false, error: `not a pdf (${JSON.stringify(magic)})` };
+    if (magic !== '%PDF-') {
+      // A CHALLENGE page is not the same failure as a wrong url, and only the first is worth
+      // a tab. Measured on PubMed Central: it answers a worker fetch with a Google reCAPTCHA
+      // interstitial. Reporting that as a plain "not a pdf" hid the one question the user
+      // could actually have answered, so the paper was lost to a captcha nobody ever saw.
+      const head = new TextDecoder().decode(
+        new Uint8Array(buf, 0, Math.min(4096, buf.byteLength)),
+      );
+      const challenged = CHALLENGE_MARKERS.test(head);
+      return {
+        ok: false,
+        challenged,
+        error: `not a pdf (${JSON.stringify(magic)})${challenged ? ' -- challenge page' : ''}`,
+      };
+    }
     return { ok: true, buf, bytes: buf.byteLength };
   } catch (err) {
     return { ok: false, error: `${err.name}: ${err.message}` };
@@ -3101,7 +3274,7 @@ function connect() {
       // cannot displace the authentic publisher file.
       let payload;
       try {
-        const out = await retrievePaper(msg);
+        const out = await retrievePaper({ ...msg, email: msg.email || await contactEmail() });
         payload = out.ok
           ? { type: 'retrieve_result', id: msg.id, ok: true, source: out.source, url: out.url,
             // savedByBrowser carries NO bytes: Chrome took the response over and wrote the

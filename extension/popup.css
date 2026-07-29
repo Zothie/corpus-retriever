@@ -252,39 +252,12 @@ button:disabled {
   background: var(--muted-3);
 }
 
-#settings {
-  margin-top: 16px;
-  border-top: 1px solid var(--border);
-  padding-top: 12px;
-}
 
-#settings summary {
-  cursor: pointer;
-  font-size: 12px;
-  color: var(--muted-2);
-  list-style: none;
-}
 
-#settings summary::-webkit-details-marker { display: none; }
 
-#settings summary::before {
-  content: '▸';
-  display: inline-block;
-  margin-right: 6px;
-  color: var(--muted-3);
-  transition: transform 0.15s ease;
-}
 
-#settings[open] summary::before { transform: rotate(90deg); }
 
-#settings label {
-  display: block;
-  margin: 12px 0 6px;
-  font-size: 12px;
-  color: var(--muted);
-}
 
-#settings label span { color: var(--muted-3); }
 
 ::-webkit-scrollbar { width: 10px; }
 ::-webkit-scrollbar-thumb { background: #e6ded3; border-radius: 999px; }
