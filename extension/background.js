@@ -1981,7 +1981,9 @@ async function retrievePaper({ doi, pdfUrl, email, coreApiKey }) {
     // On EVERY exit, including the returns that deliver a pdf. A ceiling left set would
     // bound the next call's mirror phase to this call's deadline -- already in the past --
     // so mirrors would be skipped wholesale for the rest of the worker's life.
-    setMirrorPhaseDeadline(0);
+    // Release THIS call's deadline, not every live one: a second retrieval may still be
+    // inside its own mirror phase, and clearing the lot would un-bound it.
+    clearMirrorPhaseDeadline(mirrorDeadline);
   }
   // ---8<--- end mirror phase ---8<---
 
@@ -3350,38 +3352,55 @@ let lastMirrorError = null;
  * other several levels deep; a parameter would have to be passed through functions that have
  * no other use for it, and any one omission silently restores the unbounded behaviour.
  */
-let mirrorPhaseDeadline = 0;
-// How many retrievals are inside their mirror phase right now.
+// Every retrieval currently inside its mirror phase, by its own deadline.
 //
-// The ceiling used to be a single slot, and two overlapping retrievals -- the popup and the
-// bridge, or a second click -- corrupted it: B's set overwrote A's, then B's finally set it
-// to 0 and A ran the rest of its phase with NO ceiling at all, because every helper that
-// consults boundedDeadline/mirrorPhaseExhausted reads this one variable. Counting means the
-// last one out clears it, and while any phase is live the ceiling is the EARLIEST of them,
-// which is the conservative choice: it can end a phase early, never extend one.
-let mirrorPhaseDepth = 0;
+// A SET, not one slot and not a counter. One slot let two overlapping retrievals -- the
+// popup and the bridge, or a second click, nothing serialises them -- corrupt each other:
+// B's set overwrote A's, then B's finally zeroed it and A ran on with no ceiling at all.
+// A counter fixed that but could only ever LOWER the ceiling, so when the earlier phase
+// ended the later one stayed pinned to a deadline already in the past and reported "budget
+// exhausted" for mirrors that would have answered.
+//
+// Holding them all means the ceiling is the earliest deadline STILL LIVE, and it rises again
+// as phases finish. Conservative in the right direction: it can end a phase early, never
+// extend one past its own budget.
+const mirrorPhaseDeadlines = new Set();
 
-function setMirrorPhaseDeadline(at) {
-  if (typeof at === 'number' && at > 0) {
-    mirrorPhaseDepth += 1;
-    mirrorPhaseDeadline = mirrorPhaseDeadline > 0
-      ? Math.min(mirrorPhaseDeadline, at)
-      : at;
-    return;
+function currentMirrorCeiling() {
+  let earliest = 0;
+  for (const at of mirrorPhaseDeadlines) {
+    if (earliest === 0 || at < earliest) earliest = at;
   }
-  mirrorPhaseDepth = Math.max(0, mirrorPhaseDepth - 1);
-  if (mirrorPhaseDepth === 0) mirrorPhaseDeadline = 0;
+  return earliest;
+}
+
+/**
+ * Enter a mirror phase with `at`, or leave the one that had it.
+ *
+ * Callers pass the SAME value on the way out as on the way in, so the right entry is
+ * removed when several are live.
+ */
+function setMirrorPhaseDeadline(at) {
+  if (typeof at === 'number' && at > 0) mirrorPhaseDeadlines.add(at);
+  else mirrorPhaseDeadlines.clear();
+}
+
+function clearMirrorPhaseDeadline(at) {
+  if (typeof at === 'number' && at > 0) mirrorPhaseDeadlines.delete(at);
+  else mirrorPhaseDeadlines.clear();
 }
 
 /** The soonest of a local budget and the phase ceiling. */
 function boundedDeadline(localBudgetMs) {
   const local = Date.now() + localBudgetMs;
-  return mirrorPhaseDeadline > 0 ? Math.min(local, mirrorPhaseDeadline) : local;
+  const ceiling = currentMirrorCeiling();
+  return ceiling > 0 ? Math.min(local, ceiling) : local;
 }
 
 /** True when the phase ceiling has passed, for the hops that have no budget of their own. */
 function mirrorPhaseExhausted() {
-  return mirrorPhaseDeadline > 0 && Date.now() > mirrorPhaseDeadline;
+  const ceiling = currentMirrorCeiling();
+  return ceiling > 0 && Date.now() > ceiling;
 }
 
 async function firstReachable(hosts, pathFor) {
@@ -3489,16 +3508,23 @@ function isScihubUnavailableHtml(html) {
  */
 function isMirrorChallengeHtml(html) {
   if (typeof html !== 'string' || !html) return false;
-  const h = html.toLowerCase();
+  // Only the HEAD of the document, because a challenge page is small and says so at once,
+  // while an article page carries the paper's own title and abstract further down. Scanning
+  // a whole body for English phrases would silently drop a paper whose abstract happens to
+  // contain one -- losing a paper the mirror HAS, which is strictly worse than the stray tab
+  // this function exists to prevent.
+  const h = html.slice(0, 4096).toLowerCase();
   return (
+    // Markup and vendor strings, not prose: safe to match anywhere in the head.
     h.includes('ddos-guard')
-    || h.includes('проверка на робота')
     || h.includes('/captcha/solution/')
     || h.includes('<altcha-widget')
     || h.includes('altcha.min.js')
+    || h.includes('проверка на робота')
     || h.includes('вы робот')
-    || h.includes('just a moment')          // Cloudflare
-    || h.includes('checking your browser')  // Cloudflare, English
+    // Cloudflare's wording is ORDINARY ENGLISH, so it counts only inside the <title>.
+    // "just a moment" in an abstract is a sentence; in the title it is the interstitial.
+    || /<title>[^<]*(just a moment|checking your browser|attention required)/i.test(h)
   );
 }
 

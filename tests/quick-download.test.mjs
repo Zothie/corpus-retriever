@@ -151,7 +151,7 @@ function load(downloads = {}, fetchImpl = null, tabsWork = false) {
     `${src}\nreturn { pdfFilename, downloadToBrowser, retrievePaper, parseDownloadInput, fetchPdf,`
     + `\n  slimPdf, bytesToBase64, base64ToBytes,`
     + `\n  setProbe: (fn) => { probeAvailability = fn; },`
-    + `\n  mirrorPhaseDeadline: () => mirrorPhaseDeadline };`,
+    + `\n  mirrorPhaseDeadline: () => currentMirrorCeiling(),\n  setMirrorPhaseDeadline, clearMirrorPhaseDeadline };`,
   );
   const api = f(
     chrome,
@@ -439,6 +439,28 @@ test('two overlapping retrievals cannot un-bound each other', async () => {
   await Promise.all([a, b]);
   // Only once BOTH have left does the ceiling lift.
   assert.equal(api.mirrorPhaseDeadline(), 0, 'the ceiling outlived both phases');
+});
+
+test('the ceiling RISES again when the earlier of two phases ends', async () => {
+  // The half a counter could not express. While two phases overlap the ceiling is the
+  // earlier deadline, which is right -- but when that phase ENDS, the survivor must get its
+  // own deadline back. A counter could only ever lower the ceiling, so the second of two
+  // overlapping downloads stayed pinned to a moment already past and reported "budget
+  // exhausted" for mirrors that would have answered. Wrong in the safe direction, and
+  // therefore invisible: fewer tabs, not more.
+  const api = load({}, async () => { throw new Error('offline'); });
+  const early = Date.now() + 1000;
+  const late = Date.now() + 90000;
+
+  api.setMirrorPhaseDeadline(early);
+  api.setMirrorPhaseDeadline(late);
+  assert.equal(api.mirrorPhaseDeadline(), early, 'while both are live, the earlier wins');
+
+  api.clearMirrorPhaseDeadline(early);
+  assert.equal(api.mirrorPhaseDeadline(), late, 'the survivor did not get its deadline back');
+
+  api.clearMirrorPhaseDeadline(late);
+  assert.equal(api.mirrorPhaseDeadline(), 0, 'the last one out must lift the ceiling');
 });
 
 test('a file Chrome saved by itself is erased, not left in Downloads', async () => {
