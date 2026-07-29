@@ -130,10 +130,22 @@ function load(downloads = {}, fetchImpl = null, tabsWork = false) {
       };
     },
   };
+  // A clock the test can move. The mirror phase's budget is 90 SECONDS, so the only way to
+  // exercise "the probe spent the phase" without a test that takes a minute and a half is to
+  // let the stub probe advance time itself. Everything else about Date is Node's own.
+  const skew = { ms: 0 };
+  class ClockDate extends Date {
+    constructor(...args) {
+      if (args.length) super(...args);
+      else super(Date.now() + skew.ms);
+    }
+    static now() { return Date.now() + skew.ms; }
+  }
   const f = new Function(
-    'chrome', 'console', 'URL', 'fetch', 'self',
+    'chrome', 'console', 'URL', 'fetch', 'self', 'Date',
     `${src}\nreturn { pdfFilename, downloadToBrowser, retrievePaper, parseDownloadInput, fetchPdf,`
     + `\n  slimPdf, bytesToBase64, base64ToBytes,`
+    + `\n  setProbe: (fn) => { probeAvailability = fn; },`
     + `\n  mirrorPhaseDeadline: () => mirrorPhaseDeadline };`,
   );
   const api = f(
@@ -151,9 +163,11 @@ function load(downloads = {}, fetchImpl = null, tabsWork = false) {
     URL,
     fetchImpl || (async () => { throw new Error('the network is not available in this test'); }),
     self,
+    ClockDate,
   );
   return {
     ...api,
+    skew,
     created,
     qpdfRuns,
     qpdfUrlAsks,
@@ -392,6 +406,92 @@ test('a retrieval with no DOI does not poison the next call\'s mirror phase', as
   const out = await api.retrievePaper({ doi: '10.1038/nature12373', email: 'a@b.c' });
   const order = out.attempts.map((a) => a.source);
   assert.deepEqual(order.slice(0, 3), ['scihub', 'annas', 'libgen'], order.join(' -> '));
+});
+
+// --- the availability probe's hints, as the ladder consumes them ----------------------
+//
+// The probe is stubbed rather than driven through the network here. Its own behaviour is
+// covered by tests/availability.test.mjs; what these tests pin is the LADDER's reaction to a
+// given set of hints, which a network stub can only produce indirectly and by accident.
+
+/** Load with `probeAvailability` replaced by one that answers `hints`. */
+function loadProbing(hints, { spend = 0 } = {}) {
+  const api = load({}, async () => { throw new Error('offline'); });
+  api.setProbe(async () => {
+    api.skew.ms += spend;
+    return { has: {}, ruledOut: [], ...hints };
+  });
+  return api;
+}
+
+const MIRRORS = ['scihub', 'annas', 'libgen'];
+const mirrorOrder = (out) => out.attempts.map((a) => a.source).filter((s) => MIRRORS.includes(s));
+const entryFor = (out, source) => out.attempts.find((a) => a.source === source);
+
+test('a source the probe ruled out is skipped, and SAYS it was skipped', async () => {
+  // Vanishing from `attempts` would make a skipped source indistinguishable from one that was
+  // never reached, so a hint that is simply wrong could not be diagnosed from a failure report.
+  const api = loadProbing({ ruledOut: ['annas'] });
+  const out = await api.retrievePaper({ doi: '10.1038/nature12373', email: 'a@b.c' });
+
+  assert.deepEqual(mirrorOrder(out), MIRRORS, 'the phase order changed');
+  const annas = entryFor(out, 'annas');
+  assert.match(annas.error, /^skipped: /, `annas did not report a skip: ${annas.error}`);
+  assert.match(annas.error, /probe/, `the skip does not say who ruled it out: ${annas.error}`);
+});
+
+test('a source the probe found is tried FIRST within its phase', async () => {
+  const api = loadProbing({ has: { libgen: true } });
+  const out = await api.retrievePaper({ doi: '10.1038/nature12373', email: 'a@b.c' });
+
+  assert.deepEqual(mirrorOrder(out), ['libgen', 'scihub', 'annas'], 'the hint did not promote');
+});
+
+test('when the hinted source fails, the COMPLETE ladder runs -- ruled-out sources included', async () => {
+  // The one rule that makes unpaced probing safe. `absent` is a claim the probe can get
+  // wrong: a 429 or a captcha page misread as a definitive negative. Trusting it AFTER the
+  // promoted source has already failed would turn a wrong hint into a lost paper, when the
+  // whole point of the asymmetry is that it costs only latency.
+  const api = loadProbing({ has: { libgen: true }, ruledOut: ['scihub'] });
+  const out = await api.retrievePaper({ doi: '10.1038/nature12373', email: 'a@b.c' });
+
+  assert.deepEqual(mirrorOrder(out), ['libgen', 'scihub', 'annas'], 'a source was dropped');
+  const scihub = entryFor(out, 'scihub');
+  assert.doesNotMatch(
+    scihub.error,
+    /^skipped: /,
+    `scihub was still skipped after the hint failed: ${scihub.error}`,
+  );
+});
+
+test('a probe that spends the mirror budget leaves the ladder UNHINTED', async () => {
+  // The probe walks the same mirrors the phase does, so it can spend the phase by itself.
+  // Acting on hints bought with the entire budget would reorder and skip a ladder that has
+  // no time left to run, so the hints are dropped and the plain ladder stands.
+  const api = loadProbing(
+    { has: { libgen: true }, ruledOut: ['scihub'] },
+    { spend: 120 * 1000 },
+  );
+  const out = await api.retrievePaper({ doi: '10.1038/nature12373', email: 'a@b.c' });
+
+  assert.deepEqual(mirrorOrder(out), MIRRORS, 'an exhausted probe still reordered the phase');
+  const scihub = entryFor(out, 'scihub');
+  assert.doesNotMatch(scihub.error, /probe/, `an exhausted probe still ruled out: ${scihub.error}`);
+});
+
+test('hints with no mirror in them -- the store build\'s shape -- change nothing', async () => {
+  // `probeMirror` and MIRROR_PROBE_NAMES live inside the fence the store build cuts, so the
+  // published extension's probe answers for open access only. The ladder must not assume a
+  // mirror hint exists.
+  const api = loadProbing({ has: { unpaywall: 'https://arxiv.org/pdf/2301.00001' } });
+  const out = await api.retrievePaper({
+    doi: '10.1038/nature12373',
+    pdfUrl: 'https://evil.example/x.pdf',
+    email: 'a@b.c',
+  });
+
+  const order = out.attempts.map((a) => a.source);
+  assert.deepEqual(order, ['scihub', 'annas', 'libgen', 'direct', 'nature'], order.join(' -> '));
 });
 
 /** A Response-shaped stub carrying `bytes`, enough for workerFetch's checks. */

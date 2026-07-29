@@ -1824,8 +1824,25 @@ async function retrievePaper({ doi, pdfUrl, email, coreApiKey }) {
     // Publish the ceiling so every mirror helper is bounded by the PHASE, not only by its
     // own budget.
     setMirrorPhaseDeadline(mirrorDeadline);
+    // Ask every tab-free source at once, before the sequential walk begins. The hints only
+    // reorder and skip WITHIN a phase -- no source moves between phases, and no phase is
+    // skipped, so a probe that learned nothing costs the ladder nothing but the wait.
+    let hints = { has: {}, ruledOut: [] };
     if (doi) {
-    for (const [name, run] of [
+      hints = await probeAvailability(doi, { email, coreApiKey });
+      // The same headroom idiom the loop below uses. A probe that walked the mirrors long
+      // enough to spend the phase has left nothing to reorder, and acting on its hints would
+      // then skip sources on evidence the ladder no longer has time to overturn. So an
+      // exhausted budget proceeds UNHINTED -- never unmirrored.
+      if (Date.now() + MIRROR_HOST_MIN_MS > mirrorDeadline) hints = { has: {}, ruledOut: [] };
+    }
+    // Set once a source the probe was CONFIDENT about has failed anyway. From that moment the
+    // probe's negatives are worth nothing: a 429 or a challenge page read as "does not hold
+    // this paper" is exactly the misread the asymmetry exists to make cheap, and it stays
+    // cheap only if the rest of the ladder still runs in full.
+    let hintFailed = false;
+    if (doi) {
+    const ladder = [
       ['scihub', async () => {
         // PROBE FIRST, open a tab second -- the pattern libgen and annas already use.
         //
@@ -1916,7 +1933,12 @@ async function retrievePaper({ doi, pdfUrl, email, coreApiKey }) {
           ? { ok: true, base64: out.base64, bytes: out.bytes }
           : { ok: false, error: out.error || 'libgen produced no pdf' };
       }],
-    ]) {
+    ];
+    // A confirmed hit goes to the front of its own phase; everything else keeps its measured
+    // order behind it.
+    const promoted = ladder.filter(([name]) => hints.has[name])
+      .concat(ladder.filter(([name]) => !hints.has[name]));
+    for (const [name, run] of promoted) {
       // Headroom, not a bare comparison. With 1ms left a bare `> mirrorDeadline` still lets
       // a source START, and annas/libgen then run their own independent 45s budgets and open
       // tabs the whole way -- so the phase overran by minutes while the user watched mirror
@@ -1928,6 +1950,10 @@ async function retrievePaper({ doi, pdfUrl, email, coreApiKey }) {
       if (parked[name]) {
         const mins = Math.ceil((parked[name] - Date.now()) / 60000);
         attempts.push({ source: name, error: `skipped: last attempt hit a global outage (${mins}m left)` });
+        continue;
+      }
+      if (!hintFailed && hints.ruledOut.includes(name)) {
+        attempts.push({ source: name, error: 'skipped: the probe ruled it out' });
         continue;
       }
       try {
@@ -1943,6 +1969,7 @@ async function retrievePaper({ doi, pdfUrl, email, coreApiKey }) {
         attempts.push({ source: name, error: `${err.name}: ${err.message}` });
         await parkSource(name, `${err.name}: ${err.message}`);
       }
+      if (hints.has[name]) hintFailed = true;
     }
     }
   } finally {
