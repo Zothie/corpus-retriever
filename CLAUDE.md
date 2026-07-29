@@ -69,16 +69,18 @@ edge-to-edge instead so no white notch shows at the corners.
 
 Order is load-bearing.
 
-1. **Phase 1 — open access, in parallel:** a direct URL the caller passed, plus Unpaywall,
+1. **Phase 1 — mirrors, FIRST:** scihub, annas, libgen, in that order. They hold the
+   paywalled majority and answer without a challenge and without a human, so trying them
+   before the official routes is what keeps most downloads from needing a tab at all.
+   Bounded as a group (`MIRROR_PHASE_BUDGET_MS`), because three sources at 45s each is longer
+   than a user will believe the thing is still working.
+2. **Phase 2 — open access, in parallel:** a direct URL the caller passed, plus Unpaywall,
    OpenAlex, PubMed Central, CORE. None opens a tab or involves a human.
    Unpaywall and PMC **require** a contact email and reject requests without one — with no
    email the entire phase is skipped and every download goes the slow way.
-2. **Phase 2 — publishers, sequential:** ssrn, digitalcommons, mendeley, cell, sciencedirect,
+3. **Phase 3 — publishers, sequential:** ssrn, digitalcommons, mendeley, cell, sciencedirect,
    nature, springer, wiley, acs, oup. May open a tab; may need the user to clear a challenge.
-3. **Phase 3 — mirrors, LAST:** libgen, annas, scihub. Last so an unsigned mirror copy cannot
-   displace the authentic publisher file — `%PDF-` is a 5-byte sanity check, not integrity.
-   Bounded as a group (`MIRROR_PHASE_BUDGET_MS`), because three sources at 45s each is longer
-   than a user will believe the thing is still working.
+   Last because this is the only phase that can cost the user their attention.
 
 A source that fails with a global outage is **parked for 30 minutes** (`parkSource`), so a
 dead domain does not re-cost every subsequent download.

@@ -14,8 +14,13 @@ import { dirname, join } from 'node:path';
 const repoRoot = join(dirname(fileURLToPath(import.meta.url)), '..');
 const src = readFileSync(join(repoRoot, 'extension/background.js'), 'utf8');
 
-/** Load the worker with a stub `chrome`, and hand back the pieces under test. */
-function load(downloads = {}) {
+/**
+ * Load the worker with a stub `chrome`, and hand back the pieces under test.
+ *
+ * `fetch` is optional and defaults to a refusal, so the tests that do not care about the
+ * network cannot accidentally reach it.
+ */
+function load(downloads = {}, fetchImpl = null) {
   const created = [];
   // The download is only finished when Chrome says so, so the stub must model the terminal
   // state as well as the call. `state` picks which one it reports.
@@ -52,7 +57,7 @@ function load(downloads = {}) {
     scripting: { async executeScript() { return [{ result: null }]; } },
   };
   const f = new Function(
-    'chrome', 'console', 'URL',
+    'chrome', 'console', 'URL', 'fetch',
     `${src}\nreturn { pdfFilename, downloadToBrowser, retrievePaper, parseDownloadInput };`,
   );
   const api = f(
@@ -68,6 +73,7 @@ function load(downloads = {}) {
     // Node's URL has no createObjectURL either, which is exactly the environment the worker
     // actually runs in, so a regression to the blob path fails here instead of shipping.
     URL,
+    fetchImpl || (async () => { throw new Error('the network is not available in this test'); }),
   );
   return { ...api, created };
 }
@@ -209,4 +215,42 @@ test('a url on a host the extension does not carry SAYS so', async () => {
   const out = await retrievePaper({ pdfUrl: 'https://evil.example/x.pdf' });
   assert.equal(out.ok, false);
   assert.deepEqual(out.attempts, [{ source: 'direct', error: 'host not allowlisted' }]);
+});
+
+test('the mirrors are tried FIRST, in the order scihub, annas, libgen', async () => {
+  // The ladder order is load-bearing and was previously asserted nowhere, so it could be
+  // reordered -- as it has been -- with the whole suite still green. `attempts` is the
+  // order the sources actually ran in, which is the thing worth pinning.
+  //
+  // Every fetch fails, so no source can win and all of them report. That is deliberate:
+  // a test where the first source succeeds proves only that ONE source ran.
+  const { retrievePaper } = load({}, async () => { throw new Error('offline'); });
+  const out = await retrievePaper({ doi: '10.1038/nature12373', email: 'a@b.c' });
+  assert.equal(out.ok, false);
+
+  const order = out.attempts.map((a) => a.source);
+  const mirrors = order.filter((s) => ['scihub', 'annas', 'libgen'].includes(s));
+  assert.deepEqual(mirrors, ['scihub', 'annas', 'libgen'], `ran: ${order.join(' -> ')}`);
+
+  // FIRST, not merely present: nothing else may precede them.
+  assert.equal(order[0], 'scihub', `something ran before the mirrors: ${order.join(' -> ')}`);
+});
+
+test('all three phases run in order: mirrors, then open access, then the publisher', async () => {
+  // The publisher phase is the only one that can open a tab and demand the user solve a
+  // challenge, so it must stay last. If it drifts ahead of the free sources, the cost of
+  // a download becomes the user's attention rather than a few seconds of waiting.
+  //
+  // Phase 2 is otherwise INVISIBLE in `attempts` -- resolveOaCandidates swallows its own
+  // failures, so a phase that found nothing logs nothing. A refused `direct` url is the
+  // one entry that phase always emits, so it serves as the marker for where phase 2 ran.
+  const { retrievePaper } = load({}, async () => { throw new Error('offline'); });
+  const out = await retrievePaper({
+    doi: '10.1038/nature12373',
+    pdfUrl: 'https://evil.example/x.pdf',
+    email: 'a@b.c',
+  });
+
+  const order = out.attempts.map((a) => a.source);
+  assert.deepEqual(order, ['scihub', 'annas', 'libgen', 'direct', 'nature'], order.join(' -> '));
 });

@@ -53,10 +53,10 @@ reason and a short list of everywhere it looked:
 Could not find a copy to download.
 
 Where we looked
+  Sci-Hub — no mirror served it
+  Anna's Archive — not there
   Unpaywall — no free copy
-  OpenAlex — no PDF there
   Springer — needs a subscription
-  Wiley — no PDF there
 ```
 
 That list is the point: it tells you whether the paper is behind a paywall, or simply not
@@ -68,7 +68,8 @@ The hunting. Checking the free archives, then the publisher, then finding the re
 a page designed to hide it — and, when a paper is paywalled, going to the shadow libraries by
 hand.
 
-It tries all of that in one click, in the order most likely to find a legitimate copy first.
+It tries all of that in one click, in the order most likely to produce the PDF without
+interrupting you.
 
 **On paywalled papers it does reach Sci-Hub, LibGen and Anna's Archive.** Those host papers
 without the publisher's permission, and downloading from them is copyright infringement in
@@ -88,17 +89,18 @@ Full policy: <https://zothie.github.io/corpus-studio/privacy.html>
 
 It tries sources in order and stops at the first real PDF.
 
-**1. Free archives** — fastest, always readable, tried in parallel:
+**1. Shadow libraries** — Sci-Hub · Anna's Archive · LibGen
+
+**2. Free archives** — always readable, tried in parallel:
 Unpaywall · OpenAlex · PubMed Central · CORE
 
-**2. Publishers** — using your own browser session:
+**3. Publishers** — using your own browser session:
 SSRN · DigitalCommons · Mendeley Data · Cell · ScienceDirect · Nature · Springer · Wiley ·
 ACS · OUP
 
-**3. Shadow libraries** — LibGen · Anna's Archive · Sci-Hub
-
-These come last on purpose: a mirror copy is unsigned and may be altered or mislabelled, so it
-must never displace the publisher's own file when both exist.
+Publishers come last because they are the only source that can interrupt you: that is the
+step where a tab opens and asks you to prove you are human. Everything ahead of it runs
+silently, so most downloads finish without one.
 
 **Search** (used by the desktop integration, not the popup): SSRN · arXiv · PubMed ·
 bioRxiv/medRxiv, with Crossref resolving DOIs to titles.
@@ -145,7 +147,7 @@ The extension itself ships **no dependencies** — it is plain MV3 JavaScript. `
 `xml2js` are devDependencies of the Node-side resolvers and their tests only.
 
 ```bash
-npm test        # 92 tests
+npm test        # 94 tests
 npm run check   # syntax-check the worker and the popup
 ```
 
@@ -160,22 +162,27 @@ See `CLAUDE.md` for the rest of the MV3 constraints, each of which has already c
 
 Three phases, and the order is load-bearing:
 
-1. **Open access, in parallel** — a direct URL if supplied, plus Unpaywall, OpenAlex, PubMed
-   Central, CORE. Nothing here opens a tab or involves a human.
-2. **Publishers, in sequence** — may open a tab; may require the user to clear a challenge.
-3. **Mirrors, last** — LibGen, Anna's Archive, Sci-Hub. Last on purpose: an unsigned mirror
-   copy must not displace the publisher's own file, and the `%PDF-` check is five bytes of
-   sanity, not proof of integrity. Time-boxed as a group so three slow sources cannot make a
-   download look hung.
+1. **Mirrors, first** — Sci-Hub, Anna's Archive, LibGen. They hold the paywalled majority and
+   answer without a challenge and without a human, so trying them first is what keeps most
+   downloads from needing a tab at all. Time-boxed as a group so three slow sources cannot
+   make a download look hung.
+2. **Open access, in parallel** — a direct URL if supplied, plus Unpaywall, OpenAlex, PubMed
+   Central, CORE. Nothing here opens a tab or involves a human either.
+3. **Publishers, in sequence** — last, because this is the only phase that can open a tab and
+   park on a human clearing a challenge. It should run only once everything free has missed.
 
 A source failing in a way that looks like a global outage is parked for 30 minutes, so a dead
 domain does not re-cost every later download.
+
+The order is asserted in `tests/quick-download.test.mjs` against the shipped worker source.
+It was documented as load-bearing and checked nowhere, which meant it could be reordered with
+the whole suite still green.
 
 ## Packaging a zip
 
 ```bash
 npm run build:mirrors   # everything, exactly as this repo runs it
-npm run build           # same, minus phase 3
+npm run build           # same, minus the mirrors
 ```
 
 Both write `dist-store/corpus-retriever-<version>.zip` and drop the manifest `key`, so the

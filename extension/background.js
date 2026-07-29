@@ -1739,7 +1739,77 @@ async function retrievePaper({ doi, pdfUrl, email, coreApiKey }) {
     return { ok: true, source, url, base64: btoa(bin), bytes: buf.byteLength, attempts };
   };
 
-  // PHASE 1 -- cheap and parallel: a direct url the caller already has, plus every OA API.
+  // ---8<--- mirror phase (stripped for the store build) ---8<---
+  // PHASE 1 -- mirrors, first. They hold the paywalled majority, they answer without a
+  // challenge and without a human, and they cost nothing when they miss.
+  //
+  // Bounded as a GROUP, not just per source: three sources at 45s each is over two minutes
+  // before the publisher phase has even started, and a download that takes minutes with no
+  // output is indistinguishable from one that has hung.
+  const mirrorDeadline = Date.now() + MIRROR_PHASE_BUDGET_MS;
+  const parked = await parkedSources();
+  if (doi) {
+    for (const [name, run] of [
+      ['scihub', async () => {
+        for (const host of await scihubMirrors()) {
+          const page = scihubArticleUrl(host, doi);
+          const links = await fetchLinks({ url: page });
+          const pick = links.ok ? pickScihubPdf(links.links, page) : null;
+          if (pick) {
+            const r = await fetchValidatedPdf(pick, { timeoutMs: 45000 });
+            if (r.ok) return r;
+          }
+        }
+        return { ok: false, error: 'no sci-hub mirror served it' };
+      }],
+      ['annas', async () => {
+        const page = await annasArticleUrl(doi);
+        if (!page) return { ok: false, error: 'no reachable annas mirror' };
+        const links = await fetchLinks({ url: page });
+        const pick = links.ok ? pickAnnasPdf(links.links, page) : null;
+        return pick ? fetchValidatedPdf(pick, { timeoutMs: 45000 }) : { ok: false, error: 'no file link' };
+      }],
+      ['libgen', async () => {
+        const u = await libgenPdfUrl(doi);
+        if (!u) return { ok: false, error: `not on libgen (${lastMirrorError || 'no detail'})` };
+        // Through the TAB path, not a worker fetch. libgen's get.php answers with a
+        // Content-Disposition and no CORS headers, and a worker fetch of it fails with an
+        // opaque "Failed to fetch" even though the host is granted -- while the same url
+        // downloads fine from Node. The tab path is what every walled publisher already
+        // uses and is not bound by CORS.
+        const out = await fetchPdf({ url: u, referer: `https://${new URL(u).host}/` });
+        return out.ok && out.base64
+          ? { ok: true, base64: out.base64, bytes: out.bytes }
+          : { ok: false, error: out.error || 'libgen produced no pdf' };
+      }],
+    ]) {
+      if (Date.now() > mirrorDeadline) {
+        attempts.push({ source: name, error: 'skipped: mirror phase budget exhausted' });
+        continue;
+      }
+      if (parked[name]) {
+        const mins = Math.ceil((parked[name] - Date.now()) / 60000);
+        attempts.push({ source: name, error: `skipped: last attempt hit a global outage (${mins}m left)` });
+        continue;
+      }
+      try {
+        const r = await run();
+        if (r.ok && r.buf) return deliver(name, 'mirror', r.buf);
+        // The tab path returns base64 already encoded rather than an ArrayBuffer.
+        if (r.ok && r.base64) {
+          return { ok: true, source: name, url: 'mirror', base64: r.base64, bytes: r.bytes, attempts };
+        }
+        attempts.push({ source: name, error: r.error || 'no pdf' });
+        await parkSource(name, r.error);
+      } catch (err) {
+        attempts.push({ source: name, error: `${err.name}: ${err.message}` });
+        await parkSource(name, `${err.name}: ${err.message}`);
+      }
+    }
+  }
+  // ---8<--- end mirror phase ---8<---
+
+  // PHASE 2 -- cheap and parallel: a direct url the caller already has, plus every OA API.
   // None of these opens a tab or involves a human.
   const cheap = [];
   if (pdfUrl && urlTier(pdfUrl) !== TIER.NONE) cheap.push({ source: 'direct', url: pdfUrl });
@@ -1766,7 +1836,7 @@ async function retrievePaper({ doi, pdfUrl, email, coreApiKey }) {
   const oaWin = raced.find(Boolean);
   if (oaWin) return deliver(oaWin.source, oaWin.url, oaWin.buf);
 
-  // PHASE 2 -- the publisher that owns this DOI, if any. May open a tab, may wait on a human.
+  // PHASE 3 -- the publisher that owns this DOI, if any. May open a tab, may wait on a human.
   if (doi) {
     const entry = await findPublisher(doi, pdfUrl || null).catch(() => null);
     if (entry) {
@@ -1806,75 +1876,6 @@ async function retrievePaper({ doi, pdfUrl, email, coreApiKey }) {
       }
     }
   }
-
-  // ---8<--- mirror phase (stripped for the store build) ---8<---
-  // PHASE 3 -- mirrors, last. See the note above for why they do not race phase 1.
-  //
-  // Bounded as a GROUP, not just per source: three sources at 45s each is over two minutes
-  // on top of whatever the publisher phase already spent, and a download that takes minutes
-  // with no output is indistinguishable from one that has hung.
-  const mirrorDeadline = Date.now() + MIRROR_PHASE_BUDGET_MS;
-  const parked = await parkedSources();
-  if (doi) {
-    for (const [name, run] of [
-      ['libgen', async () => {
-        const u = await libgenPdfUrl(doi);
-        if (!u) return { ok: false, error: `not on libgen (${lastMirrorError || 'no detail'})` };
-        // Through the TAB path, not a worker fetch. libgen's get.php answers with a
-        // Content-Disposition and no CORS headers, and a worker fetch of it fails with an
-        // opaque "Failed to fetch" even though the host is granted -- while the same url
-        // downloads fine from Node. The tab path is what every walled publisher already
-        // uses and is not bound by CORS.
-        const out = await fetchPdf({ url: u, referer: `https://${new URL(u).host}/` });
-        return out.ok && out.base64
-          ? { ok: true, base64: out.base64, bytes: out.bytes }
-          : { ok: false, error: out.error || 'libgen produced no pdf' };
-      }],
-      ['annas', async () => {
-        const page = await annasArticleUrl(doi);
-        if (!page) return { ok: false, error: 'no reachable annas mirror' };
-        const links = await fetchLinks({ url: page });
-        const pick = links.ok ? pickAnnasPdf(links.links, page) : null;
-        return pick ? fetchValidatedPdf(pick, { timeoutMs: 45000 }) : { ok: false, error: 'no file link' };
-      }],
-      ['scihub', async () => {
-        for (const host of await scihubMirrors()) {
-          const page = scihubArticleUrl(host, doi);
-          const links = await fetchLinks({ url: page });
-          const pick = links.ok ? pickScihubPdf(links.links, page) : null;
-          if (pick) {
-            const r = await fetchValidatedPdf(pick, { timeoutMs: 45000 });
-            if (r.ok) return r;
-          }
-        }
-        return { ok: false, error: 'no sci-hub mirror served it' };
-      }],
-    ]) {
-      if (Date.now() > mirrorDeadline) {
-        attempts.push({ source: name, error: 'skipped: mirror phase budget exhausted' });
-        continue;
-      }
-      if (parked[name]) {
-        const mins = Math.ceil((parked[name] - Date.now()) / 60000);
-        attempts.push({ source: name, error: `skipped: last attempt hit a global outage (${mins}m left)` });
-        continue;
-      }
-      try {
-        const r = await run();
-        if (r.ok && r.buf) return deliver(name, 'mirror', r.buf);
-        // The tab path returns base64 already encoded rather than an ArrayBuffer.
-        if (r.ok && r.base64) {
-          return { ok: true, source: name, url: 'mirror', base64: r.base64, bytes: r.bytes, attempts };
-        }
-        attempts.push({ source: name, error: r.error || 'no pdf' });
-        await parkSource(name, r.error);
-      } catch (err) {
-        attempts.push({ source: name, error: `${err.name}: ${err.message}` });
-        await parkSource(name, `${err.name}: ${err.message}`);
-      }
-    }
-  }
-  // ---8<--- end mirror phase ---8<---
 
   return { ok: false, error: 'no source produced a valid pdf', attempts };
 }
