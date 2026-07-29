@@ -32,6 +32,7 @@ function load(downloads = {}, fetchImpl = null, tabsWork = false) {
   // state as well as the call. `state` picks which one it reports.
   const listeners = new Set();
   const createdListeners = new Set();
+  const tabsOpened = [];
   const removedFiles = [];
   const erased = [];
   const chrome = {
@@ -68,7 +69,11 @@ function load(downloads = {}, fetchImpl = null, tabsWork = false) {
       onCreated: { addListener() {}, removeListener() {} },
       onUpdated: { addListener() {}, removeListener() {} },
       onRemoved: { addListener() {}, removeListener() {} },
-      async create() {
+      async create(opts) {
+        // Every tab this extension opens passes through here -- withClearedTab holds the
+        // only chrome.tabs.create in the worker. Recording them is what lets a test assert
+        // "no window appeared", which is the single most user-visible property there is.
+        tabsOpened.push(opts && opts.url);
         if (!tabsWork) throw new Error('no tabs in this test');
         return { id: 1 };
       },
@@ -169,6 +174,7 @@ function load(downloads = {}, fetchImpl = null, tabsWork = false) {
     ...api,
     skew,
     created,
+    tabsOpened,
     qpdfRuns,
     qpdfUrlAsks,
     removedFiles,
@@ -366,6 +372,73 @@ test('the mirror phase ceiling is cleared when the phase ends', async () => {
   assert.equal(api.mirrorPhaseDeadline(), 0, 'should start unset');
   await api.retrievePaper({ doi: '10.1038/nature12373', email: 'a@b.c' });
   assert.equal(api.mirrorPhaseDeadline(), 0, 'left set after the phase ended');
+});
+
+test('a mirror that ANSWERS but does not hold the paper opens no tab', async () => {
+  // The bug the user reported twice, in the form the suite could not see. Every mirror
+  // replies 200 here -- Anna's does that for papers it does not have -- but none of them
+  // shows any sign of holding the paper. Reachability is not evidence, and a tab must not
+  // open on it. 133 tests passed while this opened one for every DOI ever downloaded.
+  // Each mirror gets the answer IT actually gives for a paper it does not serve, because
+  // "no evidence" looks different on each and a generic page would prove nothing.
+  const api = load({}, async (url) => {
+    // Anna's says it by REDIRECTING to its search page.
+    if (url.includes('/scidb/')) {
+      return {
+        ok: true, status: 200, url: 'https://annas-archive.gd/search?q=x',
+        text: async () => '<html><title>Search</title></html>', headers: new Map(),
+      };
+    }
+    // Sci-Hub says it in the page copy, and separately serves a robot check that is not an
+    // article either. Both must leave the tab shut.
+    if (/sci-hub/.test(url)) {
+      return {
+        ok: true, status: 200, url,
+        text: async () => '<html>This article is not yet available in my database.</html>',
+        headers: new Map(),
+      };
+    }
+    // libgen: the search page simply lists no edition for the doi.
+    return {
+      ok: true, status: 200, url,
+      text: async () => '<html><body>No results</body></html>', headers: new Map(),
+    };
+  }, true);
+
+  await api.retrievePaper({ doi: '10.1016/j.cell.2014.05.010', email: 'a@b.c' });
+  assert.deepEqual(api.tabsOpened, [], `opened: ${api.tabsOpened.join(', ')}`);
+});
+
+test('a mirror serving a captcha opens no tab', async () => {
+  // Measured 2026-07-29: sci-hub.ru answered every doi -- real and invented alike -- with an
+  // identically sized robot check, and sci-hub.st answered 403 behind DDoS-Guard. A captcha
+  // is not an article page and never becomes one, so opening it shows the user a robot check
+  // for a paper the mirror may not even hold.
+  //
+  // The publisher phase DOES open a tab for a challenge, and that is right: a publisher is
+  // known to have the paper, so the user's attention buys something. A mirror serving a
+  // captcha has told us nothing, so it buys nothing.
+  const api = load({}, async (url) => ({
+    ok: true, status: 200, url,
+    text: async () => '<html><title>Sci-Hub</title>проверка на робота</html>',
+    headers: new Map(),
+  }), true);
+
+  await api.retrievePaper({ doi: '10.1016/j.cell.2014.05.010', email: 'a@b.c' });
+  assert.deepEqual(api.tabsOpened, [], `opened: ${api.tabsOpened.join(', ')}`);
+});
+
+test('two overlapping retrievals cannot un-bound each other', async () => {
+  // The ceiling is module-level, so a second retrieval used to overwrite the first's
+  // deadline and then, in its finally, set it to ZERO -- leaving the first running its
+  // mirror phase with no ceiling at all. The popup and the bridge can both be retrieving at
+  // once, and nothing serialises them.
+  const api = load({}, async () => { throw new Error('offline'); });
+  const a = api.retrievePaper({ doi: '10.1038/nature12373', email: 'a@b.c' });
+  const b = api.retrievePaper({ doi: '10.1126/science.1259855', email: 'a@b.c' });
+  await Promise.all([a, b]);
+  // Only once BOTH have left does the ceiling lift.
+  assert.equal(api.mirrorPhaseDeadline(), 0, 'the ceiling outlived both phases');
 });
 
 test('a file Chrome saved by itself is erased, not left in Downloads', async () => {

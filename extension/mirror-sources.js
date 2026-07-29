@@ -102,9 +102,26 @@ let lastMirrorError = null;
  * no other use for it, and any one omission silently restores the unbounded behaviour.
  */
 let mirrorPhaseDeadline = 0;
+// How many retrievals are inside their mirror phase right now.
+//
+// The ceiling used to be a single slot, and two overlapping retrievals -- the popup and the
+// bridge, or a second click -- corrupted it: B's set overwrote A's, then B's finally set it
+// to 0 and A ran the rest of its phase with NO ceiling at all, because every helper that
+// consults boundedDeadline/mirrorPhaseExhausted reads this one variable. Counting means the
+// last one out clears it, and while any phase is live the ceiling is the EARLIEST of them,
+// which is the conservative choice: it can end a phase early, never extend one.
+let mirrorPhaseDepth = 0;
 
 function setMirrorPhaseDeadline(at) {
-  mirrorPhaseDeadline = typeof at === 'number' && at > 0 ? at : 0;
+  if (typeof at === 'number' && at > 0) {
+    mirrorPhaseDepth += 1;
+    mirrorPhaseDeadline = mirrorPhaseDeadline > 0
+      ? Math.min(mirrorPhaseDeadline, at)
+      : at;
+    return;
+  }
+  mirrorPhaseDepth = Math.max(0, mirrorPhaseDepth - 1);
+  if (mirrorPhaseDepth === 0) mirrorPhaseDeadline = 0;
 }
 
 /** The soonest of a local budget and the phase ceiling. */
@@ -205,6 +222,38 @@ export function isScihubUnavailableHtml(html) {
 }
 
 /**
+ * Is this a challenge page rather than an article page?
+ *
+ * Measured 2026-07-29: sci-hub.ru answered EVERY doi -- real and invented alike -- with an
+ * identically sized "проверка на робота" captcha, and sci-hub.st answered 403 with a
+ * DDoS-Guard interstitial. Neither is an article, and neither becomes one when opened.
+ *
+ * This matters because the ladder's rule is "open a tab only on evidence the paper is
+ * there". A challenge page is not that evidence, but it is not the "not in my database"
+ * page either, so it slipped between the two and earned a tab -- one that shows the user a
+ * captcha for a paper the mirror may not even hold.
+ *
+ * A tab CAN legitimately be the answer to a challenge elsewhere in this extension: the
+ * publisher phase opens one precisely so a human can clear Cloudflare. The difference is
+ * that a publisher is known to hold the paper, while a mirror serving a captcha has told us
+ * nothing at all -- so spending the user's attention on it buys nothing.
+ */
+export function isMirrorChallengeHtml(html) {
+  if (typeof html !== 'string' || !html) return false;
+  const h = html.toLowerCase();
+  return (
+    h.includes('ddos-guard')
+    || h.includes('проверка на робота')
+    || h.includes('/captcha/solution/')
+    || h.includes('<altcha-widget')
+    || h.includes('altcha.min.js')
+    || h.includes('вы робот')
+    || h.includes('just a moment')          // Cloudflare
+    || h.includes('checking your browser')  // Cloudflare, English
+  );
+}
+
+/**
  * Pick the PDF out of a Sci-Hub page's links. The href comes from an untrusted page, so the
  * caller MUST still put it through the tier resolver -- this chooses, it does not grant.
  */
@@ -300,6 +349,9 @@ export async function annasArticleUrl(doi) {
   // tab to read links that were never going to be there. The user saw a window appear for a
   // paper already downloaded from another source.
   if (!isAnnasRecordUrl(hit.finalUrl)) return null;
+  // A challenge page KEEPS the /scidb/ path, so the url test alone would read it as a hit
+  // and open a tab onto a robot check for a paper nobody has established is there.
+  if (isMirrorChallengeHtml(hit.body)) return null;
   return `https://${hit.host}${path}`;
 }
 
@@ -370,6 +422,10 @@ export async function probeMirror(name, doi) {
       for (const host of await scihubMirrors()) {
         const body = await getTextMirror(scihubArticleUrl(host, doi), PROBE_TIMEOUT_MS_MIRROR);
         if (body === null) continue;               // host down: ask the next one
+        // A captcha says nothing about the paper -- measured, sci-hub.ru served the same
+        // robot check for a real doi and an invented one -- so it is not a verdict either
+        // way. Ask the next mirror rather than reporting a presence nobody established.
+        if (isMirrorChallengeHtml(body)) continue;
         return isScihubUnavailableHtml(body) ? 'absent' : 'present';
       }
       return 'unknown';                            // nothing answered
@@ -381,6 +437,8 @@ export async function probeMirror(name, doi) {
       const path = `/scidb/${doi.split('/').map(encodeURIComponent).join('/')}`;
       const hit = await firstReachable(ANNAS_MIRRORS, () => path);
       if (!hit) return 'unknown';
+      // A challenge keeps the /scidb/ path but proves nothing either way.
+      if (isMirrorChallengeHtml(hit.body)) return 'unknown';
       return isAnnasRecordUrl(hit.finalUrl) ? 'present' : 'absent';
     }
     // libgen stays two-valued: libgenPdfUrl returns null both for "not indexed" and for
