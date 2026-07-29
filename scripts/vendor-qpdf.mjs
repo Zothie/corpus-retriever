@@ -4,8 +4,9 @@
 // glue have to be real files inside the package. Fetching either from a CDN at runtime
 // is remote-hosted code and is what gets extensions rejected.
 //
-// Re-run after bumping the devDependency. tests/vendor-qpdf.test.mjs asserts the copies
-// exist and are intact, so a missing vendor directory fails the suite rather than shipping.
+// Re-run after bumping the devDependency. tests/vendor-qpdf.test.mjs hashes both vendored
+// files against node_modules, so forgetting to re-run this fails the suite rather than
+// silently shipping the previous version's glue.
 import { copyFileSync, mkdirSync, existsSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
