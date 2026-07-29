@@ -257,25 +257,60 @@ export function isScihubUnavailableHtml(html) {
  */
 export function isMirrorChallengeHtml(html) {
   if (typeof html !== 'string' || !html) return false;
-  // Only the HEAD of the document, because a challenge page is small and says so at once,
-  // while an article page carries the paper's own title and abstract further down. Scanning
-  // a whole body for English phrases would silently drop a paper whose abstract happens to
-  // contain one -- losing a paper the mirror HAS, which is strictly worse than the stray tab
-  // this function exists to prevent.
-  const h = html.slice(0, 4096).toLowerCase();
+  // Only the head of the document: a challenge page is small and says what it is at once,
+  // while an article page carries the paper's title and abstract further down. Scanning a
+  // whole body for English phrases would silently drop a paper whose abstract used one --
+  // losing a paper the mirror HAS, which is worse than the stray tab this prevents.
+  const head = html.slice(0, 4096).toLowerCase();
+
+  // NOT keyed on altcha. Measured 2026-07-29: sci-hub loads altcha.min.js on EVERY page,
+  // article pages included -- it sat at offset 988 of a page carrying a real
+  // /storage/.../kucsko2013.pdf link, and <altcha-widget> at 25420 of the same page. Keying
+  // on either skipped papers sci-hub demonstrably has, which is the exact failure this
+  // function must not cause. The widget is how a challenge is PRESENTED, not evidence that
+  // one is being demanded.
+  if (head.includes('ddos-guard')) return true;
+
+  // Sci-Hub's own robot check: no <title> at all and no storage link, where a real article
+  // page has both. The absence of a title is the cheap half; the link is the substantive
+  // half, and pickScihubPdf is what ultimately decides whether there is anything to fetch.
+  if (/проверка на робота|вы робот|are you a robot|are you are robot/.test(head)) return true;
+
+  // Cloudflare's wording is ordinary English, so it counts only inside the <title>.
+  return /<title>[^<]*(just a moment|checking your browser|attention required|ddos-guard)/i
+    .test(head);
+}
+
+
+/**
+ * Does this Sci-Hub page actually offer the paper?
+ *
+ * The POSITIVE test, and the reliable one. Measured 2026-07-29: an article page carries a
+ * <title> naming the paper and a /storage/.../<name>.pdf link; the robot check carries
+ * neither, and an invented DOI returns a page byte-identical in shape to a real one that is
+ * being challenged. So presence of the file is the only thing that separates them.
+ *
+ * Preferred over hunting for captcha markers because those keep turning out to be present on
+ * ordinary pages too -- altcha.min.js loads on every Sci-Hub page, article pages included,
+ * and keying on it skipped papers the mirror demonstrably had.
+ *
+ * The href still goes through the tier resolver before it is fetched: this decides whether
+ * to bother opening a tab, it grants nothing.
+ */
+export function scihubPageOffersPdf(html) {
+  if (typeof html !== 'string' || !html) return false;
+  // Every shape a Sci-Hub article page has used to point at the file. The storage host is
+  // the current one; embed/iframe/onclick are older mirror layouts still in the wild, and
+  // pickScihubPdf already accepts all of them -- this must not be stricter than the parser
+  // that runs next, or it would veto pages that parser could have handled.
   return (
-    // Markup and vendor strings, not prose: safe to match anywhere in the head.
-    h.includes('ddos-guard')
-    || h.includes('/captcha/solution/')
-    || h.includes('<altcha-widget')
-    || h.includes('altcha.min.js')
-    || h.includes('проверка на робота')
-    || h.includes('вы робот')
-    // Cloudflare's wording is ORDINARY ENGLISH, so it counts only inside the <title>.
-    // "just a moment" in an abstract is a sentence; in the title it is the interstitial.
-    || /<title>[^<]*(just a moment|checking your browser|attention required)/i.test(h)
+    /\/storage\/[^"'\s]+\.pdf/i.test(html)
+    || /(?:src|href)\s*=\s*["'][^"']*\.pdf/i.test(html)
+    || /location\.href\s*=\s*["'][^"']+\.pdf/i.test(html)
+    || /\/downloads?\//i.test(html)
   );
 }
+
 
 /**
  * Pick the PDF out of a Sci-Hub page's links. The href comes from an untrusted page, so the
@@ -450,7 +485,11 @@ export async function probeMirror(name, doi) {
         // robot check for a real doi and an invented one -- so it is not a verdict either
         // way. Ask the next mirror rather than reporting a presence nobody established.
         if (isMirrorChallengeHtml(body)) continue;
-        return isScihubUnavailableHtml(body) ? 'absent' : 'present';
+        if (isScihubUnavailableHtml(body)) return 'absent';
+        // A page offering no file is either a challenge or something we cannot read. Neither
+        // is a verdict about the paper, so ask the next mirror rather than claiming presence.
+        if (!scihubPageOffersPdf(body)) continue;
+        return 'present';
       }
       return 'unknown';                            // nothing answered
     }

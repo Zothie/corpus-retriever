@@ -278,7 +278,10 @@ test('sci-hub takes the first host that answers rather than walking them all', a
     if (url.includes('lowyiyiu')) return textRes('sci-hub.ru/\nsci-hub.st/\nsci-hub.su/');
     tried.push(new URL(url).hostname);
     if (tried.length === 1) throw new TypeError('Failed to fetch');
-    return textRes('<div id="article"></div>');
+    // A page OFFERING the file. An empty <div id="article"> used to satisfy this test, but
+    // it is what the robot check looks like too -- and reporting `present` for it is how a
+    // tab came to be opened onto a captcha.
+    return textRes('<div id="article"><embed src="//dacemirror.sci-hub.ru/x.pdf"></div>');
   });
   assert.equal(await probeMirror('scihub', '10.1/x'), 'present');
   assert.deepEqual(tried, ['sci-hub.ru', 'sci-hub.st'], 'stops at the first that answers');
