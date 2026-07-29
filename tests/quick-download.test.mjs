@@ -14,6 +14,12 @@ import { dirname, join } from 'node:path';
 const repoRoot = join(dirname(fileURLToPath(import.meta.url)), '..');
 const src = readFileSync(join(repoRoot, 'extension/background.js'), 'utf8');
 
+// Both must start with %PDF-, and the slimmed one must be SHORTER: slimPdf keeps the
+// original whenever recompression did not actually win, so an equal-length stub would
+// silently exercise the fallback and prove nothing.
+const ORIGINAL_PDF = new TextEncoder().encode(`%PDF-1.7\n${'padding '.repeat(64)}%%EOF\n`);
+const SLIMMED_PDF = new TextEncoder().encode('%PDF-1.7\nslimmed\n%%EOF\n');
+
 /**
  * Load the worker with a stub `chrome`, and hand back the pieces under test.
  *
@@ -83,9 +89,51 @@ function load(downloads = {}, fetchImpl = null, tabsWork = false) {
     storage: { session: { get: async () => ({}), set: async () => {} } },
     scripting: { async executeScript() { return [{ result: null }]; } },
   };
+  // The ONLY route to the wasm slimmer is chrome.runtime.getURL('vendor/qpdf.*'), so
+  // counting those calls is a direct observation of whether a code path reached qpdf --
+  // it cannot be satisfied by anything else the worker does.
+  const qpdfUrlAsks = [];
+  chrome.runtime.getURL = (path) => {
+    if (/qpdf/.test(path)) qpdfUrlAsks.push(path);
+    return `chrome-extension://t/${path}`;
+  };
+  // A stand-in for the vendored qpdf glue.
+  //
+  // `self.importScripts(...)` is the worker's only way to load it, and the glue's job is to
+  // define the global `Module` factory -- so the stub does exactly that, backed by a tiny
+  // MEMFS that hands back SLIMMED_PDF. That makes "the saved bytes are the recompressed
+  // ones" observable. A call count could not: it would pass just as happily for a code path
+  // that ran qpdf and then threw the result away.
+  const qpdfRuns = [];
+  const self = {
+    importScripts() {
+      globalThis.Module = async () => {
+        const files = new Map();
+        return {
+          FS: {
+            writeFile(path, bytes) { files.set(path, bytes); },
+            readFile(path) {
+              const got = files.get(path);
+              if (!got) throw new Error(`no such file: ${path}`);
+              return got;
+            },
+            unlink(path) {
+              if (!files.delete(path)) throw new Error(`no such file: ${path}`);
+            },
+          },
+          callMain(argv) {
+            qpdfRuns.push(argv);
+            files.set('/out.pdf', SLIMMED_PDF);
+            return 0;
+          },
+        };
+      };
+    },
+  };
   const f = new Function(
-    'chrome', 'console', 'URL', 'fetch',
+    'chrome', 'console', 'URL', 'fetch', 'self',
     `${src}\nreturn { pdfFilename, downloadToBrowser, retrievePaper, parseDownloadInput, fetchPdf,`
+    + `\n  slimPdf, bytesToBase64, base64ToBytes,`
     + `\n  mirrorPhaseDeadline: () => mirrorPhaseDeadline };`,
   );
   const api = f(
@@ -102,10 +150,13 @@ function load(downloads = {}, fetchImpl = null, tabsWork = false) {
     // actually runs in, so a regression to the blob path fails here instead of shipping.
     URL,
     fetchImpl || (async () => { throw new Error('the network is not available in this test'); }),
+    self,
   );
   return {
     ...api,
     created,
+    qpdfRuns,
+    qpdfUrlAsks,
     removedFiles,
     erased,
     // Pretend Chrome saved a file on its own, the way a navigation at a
@@ -341,4 +392,54 @@ test('a retrieval with no DOI does not poison the next call\'s mirror phase', as
   const out = await api.retrievePaper({ doi: '10.1038/nature12373', email: 'a@b.c' });
   const order = out.attempts.map((a) => a.source);
   assert.deepEqual(order.slice(0, 3), ['scihub', 'annas', 'libgen'], order.join(' -> '));
+});
+
+/** A Response-shaped stub carrying `bytes`, enough for workerFetch's checks. */
+function pdfResponse(url, bytes) {
+  return {
+    ok: true,
+    status: 200,
+    url,
+    headers: { get: () => null },
+    async arrayBuffer() {
+      return bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength);
+    },
+  };
+}
+
+test('a popup download is slimmed', async () => {
+  // The whole reason this feature exists: a popup download never reaches Corpus Studio,
+  // so if it is not slimmed here it is never slimmed at all. The app slims everything it
+  // ingests; the toolbar was the one door out of the extension with no optimiser behind it.
+  const api = load();
+  const saved = await api.downloadToBrowser(api.bytesToBase64(ORIGINAL_PDF), 'p.pdf');
+  assert.equal(saved.ok, true, saved.error);
+
+  assert.equal(api.qpdfRuns.length, 1, 'qpdf did not run on the popup path');
+
+  // The bytes Chrome was handed, not merely the fact that qpdf ran: a path that
+  // recompressed and then downloaded the original would pass a call-count assertion.
+  assert.equal(api.created.length, 1);
+  const handed = api.created[0].url.replace(/^data:application\/pdf;base64,/, '');
+  assert.equal(handed, api.bytesToBase64(SLIMMED_PDF), 'the ORIGINAL bytes were saved');
+});
+
+test('the bridge path is NOT slimmed', async () => {
+  // Corpus Studio runs its own qpdf and hashes what it was given. Slimming here would
+  // store bytes matching neither the publisher's file nor the app's own output, for no
+  // gain -- the app was going to optimise them anyway.
+  const url = 'https://arxiv.org/pdf/2301.00001';
+  const api = load({}, async () => pdfResponse(url, ORIGINAL_PDF));
+  const got = await api.retrievePaper({ pdfUrl: url });
+  assert.equal(got.ok, true, got.error);
+
+  // Byte-identical to what the source produced, decoded rather than compared as strings so
+  // a re-encoding that happened to round-trip could not hide behind an equal base64 blob.
+  assert.deepEqual(api.base64ToBytes(got.base64), ORIGINAL_PDF, 'the bridge bytes were altered');
+  assert.equal(got.bytes, ORIGINAL_PDF.length);
+
+  // And prove nothing merely handed the originals back after running qpdf anyway: the
+  // wasm module must never have been asked for on this path.
+  assert.deepEqual(api.qpdfRuns, [], 'qpdf ran on the bridge path');
+  assert.deepEqual(api.qpdfUrlAsks, [], 'the bridge path reached for the qpdf wasm');
 });

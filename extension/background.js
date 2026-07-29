@@ -472,6 +472,28 @@ function safeOrigin(url) {
   }
 }
 
+/**
+ * Base64 a byte array, in 32 KB chunks.
+ *
+ * The chunking is not stylistic. `String.fromCharCode(...bytes)` spreads one argument per
+ * byte, and a multi-megabyte paper -- which is most of them -- overflows the call stack and
+ * throws, losing a download the user already waited a minute for.
+ */
+function bytesToBase64(bytes) {
+  let bin = '';
+  for (let i = 0; i < bytes.length; i += 0x8000) {
+    bin += String.fromCharCode.apply(null, bytes.subarray(i, i + 0x8000));
+  }
+  return btoa(bin);
+}
+
+function base64ToBytes(base64) {
+  const bin = atob(base64);
+  const bytes = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i += 1) bytes[i] = bin.charCodeAt(i);
+  return bytes;
+}
+
 async function workerFetch(url, maxBytes, forceAnonymous = false, timeoutMs = FETCH_TIMEOUT_MS) {
   // Credentials are DERIVED from the url, never passed in. The previous signature took a
   // `credentials` argument defaulting to 'include', so a call site that forgot it would
@@ -509,12 +531,7 @@ async function workerFetch(url, maxBytes, forceAnonymous = false, timeoutMs = FE
     }
     const magic = new TextDecoder().decode(new Uint8Array(buf, 0, 5));
     if (magic !== '%PDF-') return { ok: false, error: `not a pdf (starts with ${JSON.stringify(magic)})` };
-    const bytes = new Uint8Array(buf);
-    let bin = '';
-    for (let i = 0; i < bytes.length; i += 0x8000) {
-      bin += String.fromCharCode.apply(null, bytes.subarray(i, i + 0x8000));
-    }
-    return { ok: true, base64: btoa(bin), bytes: buf.byteLength };
+    return { ok: true, base64: bytesToBase64(new Uint8Array(buf)), bytes: buf.byteLength };
   } catch (err) {
     return { ok: false, error: `worker fetch: ${err.name}: ${err.message}` };
   }
@@ -1642,16 +1659,27 @@ function pdfUrlBasename(pdfUrl) {
  * which never needed a bridge.
  */
 async function downloadToBrowser(base64, filename) {
+  // Slimmed HERE, and deliberately not one level up in runDownload.
+  //
+  // runDownload is shared by the popup and the native bridge so the two cannot drift, and
+  // the bridge must hand Corpus Studio the PUBLISHER'S bytes: the app runs its own qpdf
+  // over everything it ingests. Slimming in the shared path would optimise the same file
+  // twice and leave the app storing bytes that match neither the publisher's original nor
+  // its own output. This function is the last step only the popup reaches, so it is the
+  // one place where "slim it" means "slim the copy nobody else will optimise".
+  //
+  // slimPdf never throws and returns the original on every failure path, so a download can
+  // never be lost to an optimisation that did not work out.
+  const slimmed = await slimPdf(base64ToBytes(base64));
   // A DATA url, not a blob url.
   //
   // URL.createObjectURL DOES NOT EXIST in an MV3 service worker -- there is no Blob URL
   // store outside a document. Calling it threw TypeError on every single download, which
   // the popup reported as a failed retrieval, and nothing ever reached chrome://downloads.
   //
-  // The base64 is already in hand, so a data: url costs no extra encoding, and Chrome's
-  // download manager accepts it directly. There is nothing to revoke afterwards: a data url
-  // is the bytes, not a handle to them, so it dies with the string.
-  const url = `data:application/pdf;base64,${base64}`;
+  // Chrome's download manager accepts a data url directly, and there is nothing to revoke
+  // afterwards: a data url is the bytes, not a handle to them, so it dies with the string.
+  const url = `data:application/pdf;base64,${bytesToBase64(slimmed)}`;
   let id;
   try {
     id = await chrome.downloads.download({ url, filename, saveAs: false });
@@ -1767,14 +1795,17 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
 async function retrievePaper({ doi, pdfUrl, email, coreApiKey }) {
   const attempts = [];
 
-  const deliver = (source, url, buf) => {
-    const bytes = new Uint8Array(buf);
-    let bin = '';
-    for (let i = 0; i < bytes.length; i += 0x8000) {
-      bin += String.fromCharCode.apply(null, bytes.subarray(i, i + 0x8000));
-    }
-    return { ok: true, source, url, base64: btoa(bin), bytes: buf.byteLength, attempts };
-  };
+  // The publisher's own bytes, unaltered. Corpus Studio runs its own qpdf over whatever it
+  // is handed and hashes the result, so recompressing here would store a file matching
+  // neither the publisher's nor the app's -- for no gain, since the app optimises anyway.
+  const deliver = (source, url, buf) => ({
+    ok: true,
+    source,
+    url,
+    base64: bytesToBase64(new Uint8Array(buf)),
+    bytes: buf.byteLength,
+    attempts,
+  });
 
   // ---8<--- mirror phase (stripped for the store build) ---8<---
   // PHASE 1 -- mirrors, first. They hold the paywalled majority, they answer without a
@@ -3000,6 +3031,142 @@ async function resolveOaCandidates(doi, { email, coreApiKey } = {}) {
     if (hit?.pdfUrl) out.push({ source: name, ...hit });
   }
   return out;
+}
+
+// Recompress a downloaded PDF with qpdf compiled to WebAssembly, before it reaches
+// the user's Downloads folder.
+//
+// THE FLAGS BELOW ARE A CONTRACT, NOT A STARTING POINT. Corpus Studio chose qpdf over
+// ghostscript on measured evidence: across 20 test papers ghostscript MOVED ITEM
+// GEOMETRY in 19 of them, while qpdf moved it in 0. Geometry is what every
+// evidence-span highlight is anchored to, so an optimiser that shifts text silently
+// breaks the feature the corpus exists for. Every edit qpdf declines to make -- image
+// downsampling, dropping thumbnails, stripping structure trees -- is in that same
+// class. Do NOT add --remove-metadata, downsampling, or anything else here without
+// re-running that measurement.
+//
+// The slimmer is also OPTIONAL BY CONSTRUCTION: a download must never fail because an
+// optimisation did. Every failure path returns the original bytes untouched, which is
+// the same guard src/main/pipeline/stages/optimize.ts applies on the app side.
+
+const QPDF_ARGS = [
+  '--object-streams=generate',
+  '--recompress-flate',
+  '--compression-level=9',
+  '--optimize-images',
+  '--remove-unreferenced-resources=yes'
+];
+
+const PDF_MAGIC = [0x25, 0x50, 0x44, 0x46, 0x2d];
+
+function looksLikePdf(bytes) {
+  if (bytes.length < PDF_MAGIC.length) return false;
+  for (let i = 0; i < PDF_MAGIC.length; i += 1) {
+    if (bytes[i] !== PDF_MAGIC[i]) return false;
+  }
+  return true;
+}
+
+/**
+ * Recompress `bytes`, or return `bytes` unchanged.
+ *
+ * NEVER throws and never returns anything but a Uint8Array: callers hand the result
+ * straight to the download, so a rejection here would cost the user a paper they had
+ * already waited for.
+ *
+ * `runQpdf` is a parameter so the decision logic below can be exercised without wasm.
+ * Production callers pass one argument and get runQpdfWasm.
+ */
+async function slimPdf(bytes, runQpdf = runQpdfWasm) {
+  if (!(bytes instanceof Uint8Array) || bytes.length === 0) return bytes;
+
+  let out;
+  try {
+    out = await runQpdf(bytes, QPDF_ARGS);
+  } catch (err) {
+    console.warn('[slim-pdf] qpdf failed, keeping the original:', err && err.message);
+    return bytes;
+  }
+
+  if (!(out instanceof Uint8Array) || out.length === 0) return bytes;
+
+  // Not smaller means there was nothing to win. Handing back a LARGER file for no gain
+  // is a regression, so the original stands.
+  if (out.length >= bytes.length) return bytes;
+
+  // Output that is not a PDF means the run went wrong in a way its exit code did not
+  // report. Saving that would corrupt the user's file.
+  if (!looksLikePdf(out)) {
+    console.warn('[slim-pdf] qpdf output is not a PDF, keeping the original');
+    return bytes;
+  }
+
+  return out;
+}
+
+/**
+ * The in-flight or settled qpdf module load. A PROMISE, not the module: two downloads
+ * that overlap must share one instantiation rather than each paying for 1.3 MB of wasm.
+ *
+ * A FAILED load is cached too, deliberately. If wasm cannot instantiate in this browser
+ * -- the CSP is wrong, the vendored files are missing, the platform refuses -- it will
+ * be just as unavailable on the next download, so retrying spends seconds of every
+ * subsequent paper to arrive at the same "no". One failure, then slimPdf's fallback
+ * quietly keeps the originals.
+ */
+let qpdfModulePromise = null;
+
+function loadQpdf() {
+  if (qpdfModulePromise) return qpdfModulePromise;
+  qpdfModulePromise = (async () => {
+    // importScripts, not import(): this file is inlined into the classic service worker,
+    // where a dynamic import throws and kills the worker silently.
+    self.importScripts(chrome.runtime.getURL('vendor/qpdf.js'));
+    // The worker has no meaningful script directory, so the glue's default
+    // `scriptDir + "qpdf.wasm"` resolves to nothing. locateFile must be explicit.
+    return await Module({ locateFile: () => chrome.runtime.getURL('vendor/qpdf.wasm') });
+  })();
+  return qpdfModulePromise;
+}
+
+/**
+ * Run qpdf over `bytes` in MEMFS and return what it wrote.
+ *
+ * THROWS on any failure. The fallback belongs to slimPdf alone -- keeping the decision
+ * in one place is what makes "the original always survives" checkable.
+ */
+async function runQpdfWasm(bytes, args) {
+  const qpdf = await loadQpdf();
+  const input = '/in.pdf';
+  const output = '/out.pdf';
+
+  try {
+    qpdf.FS.writeFile(input, bytes);
+    const code = qpdf.callMain([...args, input, output]);
+
+    // qpdf exits 3 on warnings and still writes a valid file; treating 3 as a failure
+    // would skip every PDF with a minor spec violation, which is most of them.
+    // emscripten returns undefined when main did not report a code at all.
+    if (code !== 0 && code !== 3 && code !== undefined) {
+      throw new Error(`qpdf exited ${code}`);
+    }
+
+    return qpdf.FS.readFile(output);
+  } finally {
+    // MEMFS lives as long as the module, and the module is reused across every
+    // download, so leftovers accumulate megabytes per paper. Each unlink is guarded
+    // on its own because either file may never have been written.
+    try {
+      qpdf.FS.unlink(input);
+    } catch (err) {
+      /* never written */
+    }
+    try {
+      qpdf.FS.unlink(output);
+    } catch (err) {
+      /* never written */
+    }
+  }
 }
 
 // ---8<--- mirror sources (inlined) ---8<---
