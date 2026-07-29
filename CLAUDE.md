@@ -1,6 +1,6 @@
 # CLAUDE.md — Corpus Retriever (Chrome extension)
 
-Guidance for Claude Code working in this standalone repo (github.com/Zothie/corpus-retriever).
+Guidance for Claude Code working in this standalone repo (github.com/corpus-hub/corpus-retriever).
 
 IMPORTANT: NEVER USE EMOJIS ANYWHERE IN LOGGING, CODE OR OTHER TEXT!
 

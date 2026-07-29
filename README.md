@@ -93,7 +93,7 @@ fallback is usually what produces the PDF. Use it knowing that.
 - What you paste goes to the paper libraries and publishers. The PDF goes to your Downloads
   folder. Nothing goes anywhere else.
 
-Full policy: <https://zothie.github.io/corpus-studio/privacy.html>
+Full policy: <https://corpus-hub.github.io/corpus-studio/privacy.html>
 
 ## Where papers come from
 
@@ -237,6 +237,6 @@ enumerated — so there the name is fixed per user and a second host exits rathe
 somewhere nobody would look for it. Both sides derive the address from one definition; two
 copies of that derivation have drifted before and made a live extension look dead.
 
-[Corpus Studio](https://github.com/Zothie/corpus-studio) uses this. Nothing about the
+[Corpus Studio](https://github.com/corpus-hub/corpus-studio) uses this. Nothing about the
 extension depends on it: with no host installed the channel is simply never connected, and the
 toolbar panel works normally.

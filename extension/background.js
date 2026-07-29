@@ -2384,19 +2384,22 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
  * evading the rate limit, and would leave these services unable to throttle one bad actor
  * without blocking every user of this extension.
  */
-// UNREGISTERED as of 2026-07-30 -- checked, no MX and no A record -- so mail sent here is
-// not delivered anywhere. That is a real limitation, not a detail: Unpaywall asks for a
-// contact address so they can REACH whoever is generating load, and an undeliverable one
-// honours the letter of that and not the spirit.
+// The GitHub Pages host, which REALLY EXISTS -- an earlier version used an invented domain
+// that had never been registered, so the address was undeliverable and the identity behind it
+// unfindable. This one resolves, and a maintainer who needs to know who is generating load can
+// reach the project through it: github.com/corpus-hub/corpus-retriever/issues.
 //
-// It is used anyway because the alternative is worse: a shared hardcoded personal address
-// makes every install indistinguishable, so one abuser gets all users blocked, and asking
-// each user to type their own is the friction this replaces. The random local part at least
-// lets these services attribute and throttle ONE install without touching the rest.
+// Still not a mailbox. Unpaywall asks for a contact address so they can REACH whoever is
+// generating load, and this is a project they can find rather than a person they can email --
+// closer to the spirit than a domain nobody owns, and short of a real inbox.
 //
-// If this extension is ever published, register the domain and point it at a mailbox someone
-// reads. Until then this is a stopgap with a known gap.
-const CONTACT_DOMAIN = 'corpusretriever.org';
+// The alternative is worse in both directions: one hardcoded personal address makes every
+// install indistinguishable, so a single abuser gets everybody blocked, and asking each user to
+// type their own is exactly the friction this removes. The random local part is what lets these
+// services attribute and throttle ONE install without touching the rest.
+//
+// If a mailbox is ever wanted, point a real domain at one and change this line.
+const CONTACT_DOMAIN = 'corpus-hub.github.io';
 
 /**
  * Short and email-shaped: `word.word37@domain`. A 32-character hex string is a machine id
