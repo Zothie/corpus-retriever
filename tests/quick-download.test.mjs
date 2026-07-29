@@ -538,8 +538,15 @@ test('the bridge path is NOT slimmed', async () => {
   assert.deepEqual(api.base64ToBytes(got.base64), ORIGINAL_PDF, 'the bridge bytes were altered');
   assert.equal(got.bytes, ORIGINAL_PDF.length);
 
-  // And prove nothing merely handed the originals back after running qpdf anyway: the
-  // wasm module must never have been asked for on this path.
+  // And prove nothing merely handed the originals back after running qpdf anyway: qpdf must
+  // never have been INVOKED on this path.
+  //
+  // Deliberately not asserted on getURL('vendor/qpdf.js'): the glue is pulled in at top
+  // level, once, for the whole worker, because MV3 permits importScripts only during initial
+  // evaluation. Asking for the script is therefore not evidence of anything -- running it is.
   assert.deepEqual(api.qpdfRuns, [], 'qpdf ran on the bridge path');
-  assert.deepEqual(api.qpdfUrlAsks, [], 'the bridge path reached for the qpdf wasm');
+  assert.deepEqual(
+    api.qpdfUrlAsks.filter((u) => u.endsWith('.wasm')), [],
+    'the bridge path instantiated the qpdf wasm',
+  );
 });

@@ -17,6 +17,46 @@ const wasm = join(vendorDir, 'qpdf.wasm');
 
 const sha256 = (p) => createHash('sha256').update(readFileSync(p)).digest('hex');
 
+test('importScripts of the glue happens at TOP LEVEL, not inside a function', () => {
+  // MV3 allows importScripts ONLY while the service worker is first evaluating. Called
+  // later, from inside an async function, Chrome refuses with "NetworkError: The script
+  // failed to load" even though the file is present and a fetch of the same url returns
+  // 200 with the right bytes -- measured in a real loaded extension.
+  //
+  // That failure is INVISIBLE to every other test here: slimPdf catches it and returns the
+  // original bytes, so each download merely looks like a PDF qpdf could not improve. The
+  // suite stayed green while the feature did nothing at all, which is exactly the shape of
+  // MV3 trap 2. Only a real browser found it, so this guards the placement structurally.
+  const src = readFileSync(join(repoRoot, 'extension/slim-pdf.js'), 'utf8');
+  const lines = src.split('\n');
+  const at = lines.findIndex((l) => l.includes('self.importScripts('));
+  assert.ok(at !== -1, 'slim-pdf.js no longer loads the glue at all');
+
+  // Brace depth, not indentation. Indentation is cosmetic and a nested call can be written
+  // at any column; only the depth says whether this runs during initial evaluation. The
+  // one wrapper allowed is the top-level try/catch that keeps a missing glue from taking
+  // the whole worker down, so depth must be 0 or 1.
+  let depth = 0;
+  for (const line of lines.slice(0, at)) {
+    // Strip strings and line comments first, so a brace inside either does not count.
+    const code = line.replace(/'[^']*'|"[^"]*"|`[^`]*`/g, '').replace(/\/\/.*$/, '');
+    for (const ch of code) {
+      if (ch === '{') depth += 1;
+      else if (ch === '}') depth -= 1;
+    }
+  }
+  assert.ok(
+    depth <= 1,
+    `importScripts runs at brace depth ${depth}: it must load during initial worker `
+    + 'evaluation, not from inside a function',
+  );
+  assert.doesNotMatch(
+    lines.slice(0, at).join('\n'),
+    /(async\s+)?function[^\n]*\{[^}]*$/,
+    'importScripts sits inside a function declaration',
+  );
+});
+
 test('the qpdf glue and wasm are vendored into the extension', () => {
   assert.ok(existsSync(glue), 'run: npm run vendor:qpdf');
   assert.ok(existsSync(wasm), 'run: npm run vendor:qpdf');

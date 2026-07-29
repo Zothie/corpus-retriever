@@ -3185,6 +3185,26 @@ async function slimPdf(bytes, runQpdf = runQpdfWasm) {
   return out;
 }
 
+// Pull the qpdf glue in AT TOP LEVEL, during the worker's initial evaluation.
+//
+// This cannot be deferred. MV3 permits importScripts ONLY while the service worker is
+// first evaluating; call it later, from inside an async function, and Chrome refuses with
+// "NetworkError: The script ... failed to load" even though the file is present and
+// fetchable (verified: fetch of the same url returns 200 and the right 43,376 bytes).
+//
+// Lazy-loading it was the obvious design and it silently did nothing: slimPdf caught the
+// NetworkError, returned the original bytes, and every download looked like a PDF qpdf
+// could not improve. No unit test could see it, because they all inject the runner.
+//
+// Wrapped because a throw at top level would take the WHOLE worker down -- the ladder, the
+// bridge, the popup -- to save a few kilobytes on a download. If the glue is missing,
+// slimming is simply unavailable and slimPdf keeps returning originals.
+try {
+  self.importScripts(chrome.runtime.getURL('vendor/qpdf.js'));
+} catch (err) {
+  console.warn('[slim-pdf] qpdf glue did not load, downloads will not be slimmed:', err);
+}
+
 /**
  * The in-flight or settled qpdf module load. A PROMISE, not the module: two downloads
  * that overlap must share one instantiation rather than each paying for 1.3 MB of wasm.
@@ -3200,9 +3220,7 @@ let qpdfModulePromise = null;
 function loadQpdf() {
   if (qpdfModulePromise) return qpdfModulePromise;
   qpdfModulePromise = (async () => {
-    // importScripts, not import(): this file is inlined into the classic service worker,
-    // where a dynamic import throws and kills the worker silently.
-    self.importScripts(chrome.runtime.getURL('vendor/qpdf.js'));
+    if (typeof Module !== 'function') throw new Error('qpdf glue is not loaded');
     // The worker has no meaningful script directory, so the glue's default
     // `scriptDir + "qpdf.wasm"` resolves to nothing. locateFile must be explicit.
     return await Module({ locateFile: () => chrome.runtime.getURL('vendor/qpdf.wasm') });
