@@ -282,6 +282,17 @@ export async function annasArticleUrl(doi) {
 // --- availability probe -----------------------------------------------------------------
 
 /**
+ * The mirrors the availability probe may ask, published from HERE rather than named by the
+ * probe itself.
+ *
+ * availability.js is not mirror code and is inlined OUTSIDE the store build's fence, so a
+ * mirror name written there would survive the strip and the build would refuse to zip. It
+ * reads this list at call time instead: in the store package the whole fenced region is
+ * gone, the list is undefined, and the probe simply covers open access only.
+ */
+export const MIRROR_PROBE_NAMES = ['scihub', 'annas', 'libgen'];
+
+/**
  * Does this mirror have the paper? Answered WITHOUT opening a tab.
  *
  * Three-valued on purpose: 'present' | 'absent' | 'unknown'. Only a definitive negative is

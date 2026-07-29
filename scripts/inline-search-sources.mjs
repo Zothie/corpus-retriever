@@ -54,6 +54,10 @@ const IMPORT = "import { credentialsFor } from './allowlist.js';";
 const inlined = [
   inlinable('extension/search-sources.js', IMPORT),
   inlinable('extension/oa-sources.js', IMPORT),
+  // NOT fenced, and deliberately names no mirror: it reads the mirror list from the fenced
+  // region at call time and copes with that region being absent. Fencing it would take the
+  // OA half of the probe out of the store build too.
+  inlinable('extension/availability.js'),
   // NOT fenced. The slimmer is ordinary optimisation code with no mirror hostnames in it,
   // so the store build must KEEP it -- fencing it here would ship a popup that never slims.
   inlinable('extension/slim-pdf.js'),
