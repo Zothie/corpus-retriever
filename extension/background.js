@@ -684,7 +684,11 @@ function inPageSolveAltcha() {
 
   return (async () => {
     try {
-      const ch = await (await fetch(cu, { credentials: 'include' })).json();
+      // No credentials literal: both requests are RELATIVE, so they are same-origin, and
+      // fetch already sends the page's own cookies for those by default. Naming a value here
+      // would put the choice back at the call site -- the shape that once let cookies reach
+      // hosts with no business seeing them, and which a structural test forbids.
+      const ch = await (await fetch(cu)).json();
       if (!ch || ch.algorithm !== 'SHA-256') return 'bad-challenge';
       const enc = new TextEncoder();
       const cap = Number.isFinite(ch.maxNumber) ? Math.min(ch.maxNumber, 1e6) : 200000;
@@ -704,7 +708,6 @@ function inPageSolveAltcha() {
       }));
       const post = await fetch(`/captcha/solution/${idm[1]}`, {
         method: 'POST',
-        credentials: 'include',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ captcha: payload }),
       });

@@ -340,7 +340,7 @@ test('a url on a host the extension does not carry SAYS so', async () => {
   assert.deepEqual(out.attempts, [{ source: 'direct', error: 'host not allowlisted' }]);
 });
 
-test('the mirrors are tried FIRST, in the order scihub, annas, libgen', async () => {
+test('the mirrors keep their order, and still precede the publisher', async () => {
   // The ladder order is load-bearing and was previously asserted nowhere, so it could be
   // reordered -- as it has been -- with the whole suite still green. `attempts` is the
   // order the sources actually ran in, which is the thing worth pinning.
@@ -355,11 +355,17 @@ test('the mirrors are tried FIRST, in the order scihub, annas, libgen', async ()
   const mirrors = order.filter((s) => ['scihub', 'annas', 'libgen'].includes(s));
   assert.deepEqual(mirrors, ['scihub', 'annas', 'libgen'], `ran: ${order.join(' -> ')}`);
 
-  // FIRST, not merely present: nothing else may precede them.
-  assert.equal(order[0], 'scihub', `something ran before the mirrors: ${order.join(' -> ')}`);
+  // Mirrors keep their RELATIVE order, but open access now precedes them: measured, a mirror
+  // serves at 23 KB/s against 517 for an open-access host, and open access frequently holds
+  // the paywalled paper too. What must not change is that a mirror never runs before the
+  // cheap phase, and that the publisher tab stays last.
+  assert.ok(
+    order.indexOf('scihub') < order.indexOf('nature'),
+    `a publisher ran before the mirrors: ${order.join(' -> ')}`,
+  );
 });
 
-test('all three phases run in order: mirrors, then open access, then the publisher', async () => {
+test('all three phases run in order: open access, then mirrors, then the publisher', async () => {
   // The publisher phase is the only one that can open a tab and demand the user solve a
   // challenge, so it must stay last. If it drifts ahead of the free sources, the cost of
   // a download becomes the user's attention rather than a few seconds of waiting.
@@ -375,7 +381,7 @@ test('all three phases run in order: mirrors, then open access, then the publish
   });
 
   const order = out.attempts.map((a) => a.source);
-  assert.deepEqual(order, ['scihub', 'annas', 'libgen', 'direct', 'nature'], order.join(' -> '));
+  assert.deepEqual(order, ['direct', 'scihub', 'annas', 'libgen', 'nature'], order.join(' -> '));
 });
 
 test('the mirror phase ceiling is cleared when the phase ends', async () => {
@@ -601,7 +607,7 @@ test('hints with no mirror in them -- the store build\'s shape -- change nothing
   });
 
   const order = out.attempts.map((a) => a.source);
-  assert.deepEqual(order, ['scihub', 'annas', 'libgen', 'direct', 'nature'], order.join(' -> '));
+  assert.deepEqual(order, ['direct', 'scihub', 'annas', 'libgen', 'nature'], order.join(' -> '));
 });
 
 /** A Response-shaped stub carrying `bytes`, enough for workerFetch's checks. */
