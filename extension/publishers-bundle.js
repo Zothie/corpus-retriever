@@ -1663,9 +1663,14 @@ const PUBLISHERS = [
     pdfUrl: () => null,
     manualLabel: 'Mendeley Data dataset page',
     headed: false,
+    // STALE as of 2026-07-30: data.mendeley.com now answers "Dataset Not Found" for
+    // hxfhg7ycpr, so a run against these samples fails on the FIXTURE rather than on the
+    // resolver -- which reads as a broken source and cost a round of investigation. Kept
+    // rather than deleted because they are what the header's measurements were taken
+    // against; replace them the next time this path is verified live.
     samples: [
-      { doi: '10.17632/hxfhg7ycpr.1', url: null },
-      { doi: null, url: 'https://data.mendeley.com/datasets/hxfhg7ycpr/1' },
+      { doi: '10.17632/hxfhg7ycpr.1', url: null, stale: 'dataset removed upstream' },
+      { doi: null, url: 'https://data.mendeley.com/datasets/hxfhg7ycpr/1', stale: 'dataset removed upstream' },
     ],
   },
   {
