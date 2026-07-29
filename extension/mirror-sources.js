@@ -279,6 +279,45 @@ export async function annasArticleUrl(doi) {
   return hit ? `https://${hit.host}${path}` : null;
 }
 
+// --- availability probe -----------------------------------------------------------------
+
+/**
+ * Does this mirror have the paper? Answered WITHOUT opening a tab.
+ *
+ * Three-valued on purpose: 'present' | 'absent' | 'unknown'. Only a definitive negative is
+ * 'absent' -- for sci-hub, the "not yet available in my database" page, which is
+ * conclusive because no link will ever render there whatever its JS does. A host that is
+ * down, rate-limiting or slow is 'unknown', and the caller must never treat that as a
+ * reason to skip the source.
+ *
+ * Anna's and libgen can therefore NEVER answer 'absent': their resolvers return null both
+ * for "this paper is not here" and for "no mirror answered", and those are not the same
+ * claim. Collapsing them would let one rate-limited host be reported as the paper not
+ * existing, so the ambiguous null is reported as the ambiguity it is.
+ *
+ * Sci-hub's host list rotates and comes off the network, so this walks hosts and takes the
+ * FIRST that answers rather than probing all of them -- otherwise one mirror serialises
+ * the whole parallel probe behind five 12-second timeouts.
+ */
+export async function probeMirror(name, doi) {
+  if (!doi) return 'unknown';
+  try {
+    if (name === 'scihub') {
+      for (const host of await scihubMirrors()) {
+        const body = await getTextMirror(scihubArticleUrl(host, doi), PROBE_TIMEOUT_MS_MIRROR);
+        if (body === null) continue;               // host down: ask the next one
+        return isScihubUnavailableHtml(body) ? 'absent' : 'present';
+      }
+      return 'unknown';                            // nothing answered
+    }
+    if (name === 'annas') return (await annasArticleUrl(doi)) ? 'present' : 'unknown';
+    if (name === 'libgen') return (await libgenPdfUrl(doi)) ? 'present' : 'unknown';
+  } catch {
+    return 'unknown';
+  }
+  return 'unknown';
+}
+
 /** Pick the file link out of a hydrated Anna's scidb page. */
 export function pickAnnasPdf(hrefs, pageUrl) {
   if (!Array.isArray(hrefs)) return null;

@@ -18,8 +18,10 @@ import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 
 const repoRoot = join(dirname(fileURLToPath(import.meta.url)), '..');
-const { scihubMirrors, scihubArticleUrl, pickScihubPdf, libgenPdfUrl, annasArticleUrl, pickAnnasPdf } =
-  await import(join(repoRoot, 'extension/mirror-sources.js'));
+const {
+  scihubMirrors, scihubArticleUrl, pickScihubPdf, libgenPdfUrl, annasArticleUrl, pickAnnasPdf,
+  probeMirror,
+} = await import(join(repoRoot, 'extension/mirror-sources.js'));
 
 const realFetch = globalThis.fetch;
 function stubFetch(handler) { globalThis.fetch = async (url, opts) => handler(String(url), opts || {}); }
@@ -205,6 +207,95 @@ test("anna's picks a file link out of a hydrated page", () => {
     'https://annas-archive.gd/scidb/dl/abc/paper.pdf');
   assert.match(pickAnnasPdf(['https://ipfs.io/ipfs/Qm123'], page), /\/ipfs\//);
   assert.equal(pickAnnasPdf(['/about', '/donate'], page), null);
+});
+
+// --- the availability probe ---------------------------------------------------------------
+
+// probeMirror answers "does this mirror have it" without opening a tab, and the value of the
+// answer rests entirely on 'absent' meaning DEFINITELY NOT. The probe fires alongside every
+// other source at once and the rate limiter is a no-op stub, so a 429 is an ordinary outcome;
+// if a 429 read as "absent" the ladder would skip a mirror that has the paper and the user
+// would be told it does not exist. Every test below exists to hold that line.
+
+test('sci-hub not-found page is the one definitive negative', async () => {
+  stubFetch(async (url) => {
+    if (url.includes('lowyiyiu')) return textRes('sci-hub.ru/');
+    return textRes('<html>Unfortunately, this article is not yet available in my database</html>');
+  });
+  assert.equal(await probeMirror('scihub', '10.1/x'), 'absent');
+});
+
+test('a sci-hub article page reads as present', async () => {
+  stubFetch(async (url) => {
+    if (url.includes('lowyiyiu')) return textRes('sci-hub.ru/');
+    return textRes('<div id="article"><embed src="//dacemirror.sci-hub.ru/x.pdf"></div>');
+  });
+  assert.equal(await probeMirror('scihub', '10.1/x'), 'present');
+});
+
+test('sci-hub hosts that all fail are unknown, never absent', async () => {
+  // A dead or rate-limiting host says nothing about the paper. This is the exact case that
+  // must not be collapsed into 'absent'.
+  stubFetch(async (url) => {
+    if (url.includes('lowyiyiu')) return textRes('sci-hub.ru/\nsci-hub.st/');
+    throw new TypeError('Failed to fetch');
+  });
+  assert.equal(await probeMirror('scihub', '10.1/x'), 'unknown');
+});
+
+test('sci-hub takes the first host that answers rather than walking them all', async () => {
+  // One mirror must not serialise the whole parallel probe behind five timeouts.
+  const tried = [];
+  stubFetch(async (url) => {
+    if (url.includes('lowyiyiu')) return textRes('sci-hub.ru/\nsci-hub.st/\nsci-hub.su/');
+    tried.push(new URL(url).hostname);
+    if (tried.length === 1) throw new TypeError('Failed to fetch');
+    return textRes('<div id="article"></div>');
+  });
+  assert.equal(await probeMirror('scihub', '10.1/x'), 'present');
+  assert.deepEqual(tried, ['sci-hub.ru', 'sci-hub.st'], 'stops at the first that answers');
+});
+
+test('a resolver that throws is unknown, not a rejection', async () => {
+  // A non-string body makes scihubMirrors throw where nothing else catches it. The probe is
+  // called from a Promise.allSettled fan-out, but it still owes its caller a value.
+  stubFetch(async () => ({ ok: true, status: 200, text: async () => 12345 }));
+  assert.equal(await probeMirror('scihub', '10.1/x'), 'unknown');
+});
+
+test('no doi means no probe', async () => {
+  let called = false;
+  stubFetch(async () => { called = true; return textRes(''); });
+  assert.equal(await probeMirror('scihub', null), 'unknown');
+  assert.equal(called, false);
+});
+
+test('an unrecognised mirror name is unknown', async () => {
+  stubFetch(async () => { throw new Error('must not be called'); });
+  assert.equal(await probeMirror('nosuchmirror', '10.1/x'), 'unknown');
+});
+
+test("anna's resolving is present, and failing to resolve is UNKNOWN not absent", async () => {
+  stubFetch(async () => textRes('<html></html>'));
+  assert.equal(await probeMirror('annas', '10.1/x'), 'present');
+
+  // THE rule most likely to be broken later. annasArticleUrl returns null both for "not
+  // found" and for "no mirror answered", so null can never be reported as a negative.
+  stubFetch(async () => { throw new TypeError('Failed to fetch'); });
+  assert.equal(await probeMirror('annas', '10.1/x'), 'unknown');
+});
+
+test('libgen resolving is present, and failing to resolve is UNKNOWN not absent', async () => {
+  stubFetch(async (url) => {
+    if (url.includes('index.php')) return textRes('<a href="edition.php?id=1">x</a>');
+    if (url.includes('edition.php')) return textRes('<a href="/ads.php?md5=a">dl</a>');
+    return textRes('<a href="get.php?md5=a&key=K">GET</a>');
+  });
+  assert.equal(await probeMirror('libgen', '10.1/x'), 'present');
+
+  // Same rule: libgen rate-limits readily, and a 429 is not the paper being missing.
+  stubFetch(async () => ({ ok: false, status: 429 }));
+  assert.equal(await probeMirror('libgen', '10.1/x'), 'unknown');
 });
 
 test("anna's falls through to the next mirror", async () => {
