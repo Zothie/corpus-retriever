@@ -38,8 +38,11 @@ function looksLikePdf(bytes) {
  * NEVER throws and never returns anything but a Uint8Array: callers hand the result
  * straight to the download, so a rejection here would cost the user a paper they had
  * already waited for.
+ *
+ * `runQpdf` is a parameter so the decision logic below can be exercised without wasm.
+ * Production callers pass one argument and get runQpdfWasm.
  */
-export async function slimPdf(bytes) {
+export async function slimPdf(bytes, runQpdf = runQpdfWasm) {
   if (!(bytes instanceof Uint8Array) || bytes.length === 0) return bytes;
 
   let out;
@@ -130,5 +133,3 @@ async function runQpdfWasm(bytes, args) {
     }
   }
 }
-
-var runQpdf = runQpdf || runQpdfWasm;
