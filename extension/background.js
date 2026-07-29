@@ -92,6 +92,9 @@ const MIRROR_HOST_MIN_MS = 15 * 1000;
 // What an open-access retry through a tab may spend. Short: these hosts are not walled and
 // need no human, so a slow one is a dead one, and the mirrors are still waiting behind it.
 const OA_TAB_BUDGET_MS = 20 * 1000;
+// How long to wait for Chrome to REGISTER a download after it destroyed the tab for it. The
+// two are not simultaneous: the tab goes first and downloads.onCreated fires shortly after.
+const STRAY_GRACE_MS = 3000;
 // What the publisher phase may spend on ONE publisher.
 //
 // It used to inherit HUMAN_SOLVE_BUDGET_MS -- an hour -- on the reasoning that a human may be
@@ -840,7 +843,16 @@ function inPageSolveAltcha() {
 function inPageFetchAsBase64(target, maxBytes) {
   return (async () => {
     try {
-      const res = await fetch(target, { credentials: 'include' });
+      // credentials OMITTED, deliberately.
+      //
+      // The CDN answers `Access-Control-Allow-Origin: *`, and the CORS spec forbids pairing a
+      // wildcard origin with credentials -- the browser rejects the response before any code
+      // sees it, surfacing as an opaque "TypeError: Failed to fetch". Measured: the same url
+      // fetched without credentials returns 200 and 943776 bytes.
+      //
+      // Nothing is lost by omitting them: these are presigned, single-use file urls that
+      // carry their own authorisation in the path and need no cookie.
+      const res = await fetch(target, { credentials: 'omit' });
       if (!res.ok) return { ok: false, error: `http ${res.status}` };
       const buf = await res.arrayBuffer();
       if (buf.byteLength > maxBytes) return { ok: false, error: `too large (${buf.byteLength})` };
@@ -1814,7 +1826,7 @@ async function fetchPdf({ url, referer, budgetMs, navigateTo }) {
       result = { ...result, error: `${result.error} TRACE=${trace.join('|')}` };
     }
     return result;
-  }, budgetMs);
+  }, budgetMs, navigateTo);
 
   // A tab that VANISHED because Chrome turned the navigation into a download is not a
   // failure -- the bytes are arriving, and this call is what asked for them. LibGen's
@@ -1824,6 +1836,17 @@ async function fetchPdf({ url, referer, budgetMs, navigateTo }) {
   //
   // `strays` is the set of downloads Chrome began while this call was navigating, so it is
   // the evidence: a tab that disappeared with one in flight disappeared FOR it.
+  // Chrome registers the download a beat AFTER it destroys the tab, so `strays` can still be
+  // empty at the moment the navigation fails. Give onCreated a short grace period before
+  // concluding nothing was downloading -- measured: the tab dies first, the download appears
+  // within a few hundred ms, and without this the rescue looked at an empty set and gave up
+  // on a file that was already being written.
+  if (!out.ok && /tab-gone/.test(out.error || '') && strays.size === 0) {
+    const until = Date.now() + STRAY_GRACE_MS;
+    while (strays.size === 0 && Date.now() < until) {
+      await new Promise((r) => setTimeout(r, 100));
+    }
+  }
   if (!out.ok && /tab-gone/.test(out.error || '')) {
     devDecide('tab-gone', strays.size > 0 ? 'rescue' : 'give-up',
       strays.size > 0 ? 'a download was in flight' : 'no download was started',
@@ -2553,18 +2576,19 @@ async function retrievePaper({ doi, pdfUrl, email, coreApiKey, only, skip }) {
           links.ok ? 'harvested the page' : String(links.error).slice(0, 70),
           { links: links.ok ? links.links.length : 0, pick: pick ? String(pick).slice(0, 80) : null });
         if (!pick) return { ok: false, error: 'no file link' };
-        // NAVIGATED to, not fetched.
+        // Fetched FROM INSIDE THE TAB, which is the one context that can read it.
         //
-        // An in-page fetch was tried first and dies with "TypeError: Failed to fetch": the
-        // CDN serves no CORS headers, so Anna's own page may not read it either. A worker
-        // fetch is not an option either -- the host is random per request, so there is
-        // nothing to allowlist.
+        // Measured on the live CDN: it answers 200 with `Content-Type: application/pdf`,
+        // `Content-Length` and `Access-Control-Allow-Origin: *` -- so a cross-origin read IS
+        // permitted, and an earlier "TypeError: Failed to fetch" was the worker lacking a
+        // host_permissions grant rather than CORS. The page's own context has no such
+        // restriction.
         //
-        // Navigation is bound by none of that. The CDN answers with a Content-Disposition,
-        // so Chrome takes the response over and writes the file itself, which is exactly the
-        // path libgen already succeeds on. The tab dies in the process and the stray-download
-        // watcher reports what landed.
-        return navigateToFileInTab(page, pick, remaining);
+        // Navigation is NOT the answer here: with no `Content-Disposition`, Chrome renders
+        // the pdf in its viewer instead of downloading it, so nothing ever reaches the
+        // stray-download watcher and the tab just dies unscriptable. That is what the trace
+        // showed -- "no download was started" after a full grace period.
+        return fetchLinkedFileInTab(page, pick, remaining);
       }],
       ['libgen', async () => {
         const u = await libgenPdfUrl(doi);
