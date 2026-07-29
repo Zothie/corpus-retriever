@@ -35,8 +35,8 @@ export async function probeAvailability(doi, { email, coreApiKey } = {}) {
   // Return on the FIRST usable hint, and let the stragglers finish in the background.
   //
   // Waiting for all of them is waiting for the slowest, and the whole point of the hint is
-  // to start the download sooner. Measured live: sci-hub answered "present" at 1452ms while
-  // the group did not settle until 2258ms, so 806ms of the probe's cost bought an answer
+  // to start the download sooner. Measured live: the first source answered "present" at 1452ms
+  // while the group did not settle until 2258ms, so 806ms of the probe cost bought an answer
   // nobody was going to act on -- the ladder was always going to try that first source next.
   //
   // The stragglers are NOT cancelled. They are cheap GET requests already in flight, they

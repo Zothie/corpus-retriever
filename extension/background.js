@@ -654,23 +654,23 @@ function inPageFetch(url, maxBytes, credentials, timeoutMs) {
  * a phase meant to last 90.
  */
 /**
- * Solve Sci-Hub's ALTCHA proof-of-work FROM INSIDE THE TAB.
+ * Solve an ALTCHA proof-of-work FROM INSIDE THE TAB.
  *
  * ALTCHA is a hashcash, not a puzzle: the page is handed a salt and a target SHA-256 and
  * must find the integer n where sha256(salt + n) matches. Measured live: maxNumber is
- * 200000 and the answer lands in ~100ms. There is no image and nothing for a human to look
- * at, so waiting for one was always the wrong shape.
+ * 200000 and the answer lands in about 100ms. There is no image and nothing for a human to
+ * look at, so waiting for one was always the wrong shape.
  *
- * IN THE TAB, deliberately, and not in the worker. Sci-Hub is ANONYMOUS tier, so
- * credentialsFor gives the worker `omit` -- it can solve the challenge and then throws away
- * the session cookie the solution sets, so the very next fetch is challenged again. Measured
- * exactly that: solve returned true, the re-fetch came back 7313B and still challenged. The
- * tab has its own cookie jar, so the solve sticks there without granting the worker cookies
- * for a host the allowlist deliberately keeps at arm's length.
+ * IN THE TAB, deliberately, and not in the worker. The hosts that serve this are ANONYMOUS
+ * tier, so credentialsFor hands the worker `omit` -- it can solve the challenge and then
+ * throws away the session cookie the solution sets, so the very next fetch is challenged
+ * again. Measured exactly that: solve returned true, the re-fetch came back still
+ * challenged. The tab has its own cookie jar, so the solve sticks there without granting
+ * the worker cookies for a host the allowlist deliberately keeps at arm's length.
  *
- * The submission shape was read out of the page's own handler and is not the documented one:
- * a JSON body `{captcha: <base64>}`, not the form-encoded `altcha=` ALTCHA describes. The
- * documented shape returns 200 with {"success":false}.
+ * The submission shape was read out of the page's own handler and is NOT the documented
+ * one: a JSON body `{captcha: <base64>}`, not the form-encoded `altcha=` that the ALTCHA
+ * docs describe. The documented shape returns 200 with {"success":false}.
  *
  * Runs in the PAGE, so it may use only what the page has. Returns a short status string.
  */
@@ -3353,8 +3353,8 @@ async function probeAvailability(doi, { email, coreApiKey } = {}) {
   // Return on the FIRST usable hint, and let the stragglers finish in the background.
   //
   // Waiting for all of them is waiting for the slowest, and the whole point of the hint is
-  // to start the download sooner. Measured live: sci-hub answered "present" at 1452ms while
-  // the group did not settle until 2258ms, so 806ms of the probe's cost bought an answer
+  // to start the download sooner. Measured live: the first source answered "present" at 1452ms
+  // while the group did not settle until 2258ms, so 806ms of the probe cost bought an answer
   // nobody was going to act on -- the ladder was always going to try that first source next.
   //
   // The stragglers are NOT cancelled. They are cheap GET requests already in flight, they
