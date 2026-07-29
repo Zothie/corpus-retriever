@@ -65,3 +65,70 @@ export async function slimPdf(bytes) {
 
   return out;
 }
+
+/**
+ * The in-flight or settled qpdf module load. A PROMISE, not the module: two downloads
+ * that overlap must share one instantiation rather than each paying for 1.3 MB of wasm.
+ *
+ * A FAILED load is cached too, deliberately. If wasm cannot instantiate in this browser
+ * -- the CSP is wrong, the vendored files are missing, the platform refuses -- it will
+ * be just as unavailable on the next download, so retrying spends seconds of every
+ * subsequent paper to arrive at the same "no". One failure, then slimPdf's fallback
+ * quietly keeps the originals.
+ */
+let qpdfModulePromise = null;
+
+function loadQpdf() {
+  if (qpdfModulePromise) return qpdfModulePromise;
+  qpdfModulePromise = (async () => {
+    // importScripts, not import(): this file is inlined into the classic service worker,
+    // where a dynamic import throws and kills the worker silently.
+    self.importScripts(chrome.runtime.getURL('vendor/qpdf.js'));
+    // The worker has no meaningful script directory, so the glue's default
+    // `scriptDir + "qpdf.wasm"` resolves to nothing. locateFile must be explicit.
+    return await Module({ locateFile: () => chrome.runtime.getURL('vendor/qpdf.wasm') });
+  })();
+  return qpdfModulePromise;
+}
+
+/**
+ * Run qpdf over `bytes` in MEMFS and return what it wrote.
+ *
+ * THROWS on any failure. The fallback belongs to slimPdf alone -- keeping the decision
+ * in one place is what makes "the original always survives" checkable.
+ */
+async function runQpdfWasm(bytes, args) {
+  const qpdf = await loadQpdf();
+  const input = '/in.pdf';
+  const output = '/out.pdf';
+
+  try {
+    qpdf.FS.writeFile(input, bytes);
+    const code = qpdf.callMain([...args, input, output]);
+
+    // qpdf exits 3 on warnings and still writes a valid file; treating 3 as a failure
+    // would skip every PDF with a minor spec violation, which is most of them.
+    // emscripten returns undefined when main did not report a code at all.
+    if (code !== 0 && code !== 3 && code !== undefined) {
+      throw new Error(`qpdf exited ${code}`);
+    }
+
+    return qpdf.FS.readFile(output);
+  } finally {
+    // MEMFS lives as long as the module, and the module is reused across every
+    // download, so leftovers accumulate megabytes per paper. Each unlink is guarded
+    // on its own because either file may never have been written.
+    try {
+      qpdf.FS.unlink(input);
+    } catch (err) {
+      /* never written */
+    }
+    try {
+      qpdf.FS.unlink(output);
+    } catch (err) {
+      /* never written */
+    }
+  }
+}
+
+var runQpdf = runQpdf || runQpdfWasm;
