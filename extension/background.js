@@ -834,7 +834,7 @@ function inPageSolveAltcha() {
  * What this page looks like right now, in the terms every decision here turns on.
  *
  * Injected into the tab so a trace can answer "what was actually on screen" without anyone
- * re-fetching the url later and hoping it looks the same. It does not: Sci-Hub alternates
+ * re-fetching the url later and hoping it looks the same. It does not: some hosts alternate
  * between a challenge and the article for one url, so evidence gathered afterwards is
  * evidence about a different page.
  */
@@ -1616,15 +1616,15 @@ async function waitForStrayDownload(ids, timeoutMs = 120000) {
  * into the result.
  */
 async function navigateToFileInTab(page, target, budgetMs) {
-  devMark('annas:navigate-begin', { page: String(page).slice(0, 70), budgetMs });
+  devMark('linked-file:navigate-begin', { page: String(page).slice(0, 70), budgetMs });
   const out = await fetchPdf({ url: page, referer: page, budgetMs, navigateTo: target });
-  devMark('annas:navigate-end', { ok: out.ok, saved: out.savedByBrowser === true,
+  devMark('linked-file:navigate-end', { ok: out.ok, saved: out.savedByBrowser === true,
     error: out.ok ? undefined : String(out.error).slice(0, 70) });
   if (out.ok && out.base64) return { ok: true, base64: out.base64, bytes: out.bytes };
   if (out.ok && out.savedByBrowser) {
     return { ok: true, savedByBrowser: true, filename: out.filename, bytes: out.bytes };
   }
-  return { ok: false, error: out.error || 'annas produced no pdf' };
+  return { ok: false, error: out.error || 'the linked file produced no pdf' };
 }
 
 async function fetchLinkedFileInTab(page, target, budgetMs) {
@@ -1633,7 +1633,7 @@ async function fetchLinkedFileInTab(page, target, budgetMs) {
       target: { tabId }, func: inPageFetchAsBase64, args: [target, MAX_PDF_BYTES],
     });
     const out = (r && r.result) || { ok: false, error: 'in-page fetch returned nothing' };
-    devHttp('annas:file', {
+    devHttp('linked-file', {
       url: target, bytes: out.ok ? out.bytes : undefined,
       magic: out.ok ? '%PDF-' : undefined, error: out.ok ? undefined : out.error,
     });
@@ -2925,7 +2925,7 @@ const CHALLENGE_MARKERS = new RegExp([
   'just a moment|attention required',// Cloudflare, English wording
   'checking your browser',           // Cloudflare / DDoS-Guard
   'ddos-guard',                      // DDoS-Guard
-  'altcha',                          // ALTCHA proof-of-work -- Sci-Hub
+  'altcha',                          // ALTCHA proof-of-work
   'gokuprops|awswaf',                // AWS WAF
   'incapsula|_incap_|imperva',       // Imperva / Incapsula
   'perimeterx|px-captcha|human-challenge', // PerimeterX / HUMAN
@@ -2935,7 +2935,7 @@ const CHALLENGE_MARKERS = new RegExp([
   'funcaptcha|arkoselabs',           // Arkose Labs
   'friendlycaptcha',                 // Friendly Captcha
   'mtcaptcha',                       // MTCaptcha
-  'проверка на робота|вы робот',     // Sci-Hub, Russian
+  'проверка на робота|вы робот',     // Russian-language robot check
 ].join('|'), 'i');
 
 /** Fetch a url and accept it only if the bytes really are a pdf. Never throws. */
@@ -3464,9 +3464,9 @@ try {
 // WHY THIS EXISTS, and why it is ON by default.
 //
 // Every investigation of this extension so far has been a guess dressed up as a diagnosis.
-// A download reported "no sci-hub mirror served it" and the only way to learn what the page
+// A download reported that no mirror had served it, and the only way to learn what the page
 // actually contained was to re-fetch it by hand, minutes later, in a different profile, and
-// hope it looked the same. It usually did not: Sci-Hub alternates between a challenge and
+// hope it looked the same. It usually did not: some hosts alternate between a challenge and
 // the article for the same url, so the evidence was gone by the time anyone looked. Wrong
 // conclusions followed -- "upstream throttling" that was really a test timeout, a captcha
 // marker that also appears on good pages, a duplicate file blamed on double-downloading.

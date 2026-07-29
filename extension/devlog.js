@@ -4,9 +4,9 @@
 // WHY THIS EXISTS, and why it is ON by default.
 //
 // Every investigation of this extension so far has been a guess dressed up as a diagnosis.
-// A download reported "no sci-hub mirror served it" and the only way to learn what the page
+// A download reported that no mirror had served it, and the only way to learn what the page
 // actually contained was to re-fetch it by hand, minutes later, in a different profile, and
-// hope it looked the same. It usually did not: Sci-Hub alternates between a challenge and
+// hope it looked the same. It usually did not: some hosts alternate between a challenge and
 // the article for the same url, so the evidence was gone by the time anyone looked. Wrong
 // conclusions followed -- "upstream throttling" that was really a test timeout, a captcha
 // marker that also appears on good pages, a duplicate file blamed on double-downloading.

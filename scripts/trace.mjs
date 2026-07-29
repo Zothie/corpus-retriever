@@ -6,15 +6,23 @@
 import net from 'node:net';
 import { readdirSync } from 'node:fs';
 
-// USER is not always set (cron, sandboxes, some shells), and `/tmp/ssrn-bridge-undefined`
-// fails with an ENOENT that looks like "the extension is not running".
-import os from 'node:os';
-const dir = `/tmp/ssrn-bridge-${process.env.USER || process.env.LOGNAME || os.userInfo().username}`;
+// The address comes from the HOST's own definition, not a copy.
+//
+// A copy here would be a third derivation of an address that two processes must agree on --
+// and it would be Unix-only, so this tool would report "extension not running" on every
+// Windows machine while the bridge was answering on a named pipe.
+import { socketAddressFor, socketDirFor, socketIsFile } from '../src/bridge/corpus-retriever-host.js';
+
+const dir = socketDirFor();
+
 // Newest socket wins: a reload leaves the old one behind for a moment.
 // A reload kills the host, which removes its socket and sometimes the directory with it, so
 // "not there" is a NORMAL mid-reload state rather than an error. The readiness loop keeps
 // polling until Chrome respawns the host and a new socket appears.
 function pick() {
+  // A named pipe cannot be enumerated: the name is fixed, so there is nothing to scan and
+  // the connect attempt is the existence check.
+  if (!socketIsFile()) return socketAddressFor();
   let socks = [];
   try {
     socks = readdirSync(dir).filter((f) => f.endsWith('.sock'));

@@ -141,16 +141,25 @@ function log(...parts) {
   process.stderr.write(`[ssrn-native-host] ${parts.join(' ')}\n`);
 }
 
-/** The logged-in user, as both sides of the bridge must compute it identically. */
+/**
+ * The logged-in user, as both sides of the bridge must compute it identically.
+ *
+ * SANITISED, because the name goes into an address. An Entra-joined Windows machine reports
+ * `AzureAD\jdoe` or a `user@tenant.com` UPN, and a backslash inside a pipe name silently
+ * creates a differently-shaped name -- legal to bind, and a trap the moment the two sides
+ * normalise it even slightly differently. Restricting to a conservative set makes the two
+ * derivations agree by construction rather than by luck.
+ */
 function bridgeUser() {
   // userInfo().username rather than $USER: Chrome does not necessarily pass a
   // useful environment to the host it spawns.
+  let user = 'unknown';
   try {
-    return os.userInfo().username;
+    user = os.userInfo().username;
   } catch {
     // The pid still makes the address unique; only the per-user split is lost.
-    return 'unknown';
   }
+  return String(user).replace(/[^A-Za-z0-9._-]/g, '_') || 'unknown';
 }
 
 /**
@@ -821,6 +830,21 @@ function main() {
   });
 
   server.on('error', (err) => {
+    // A NAME ALREADY TAKEN is not a failure, it is a duplicate host losing a race.
+    //
+    // On Windows the pipe name is fixed per user, because a pipe name cannot be enumerated
+    // and both sides therefore have to derive the same one. So a second host must not linger:
+    // it would be listening at an address nobody looks at, while the winner serves the
+    // bridge. Exit 0 says "nothing to do here" rather than reporting a fault.
+    //
+    // Cannot fire on Unix, where the address carries the pid and is unlinked first -- so a
+    // genuine bind failure there (EACCES on the directory, ENOENT) still falls through to
+    // shutdown(1) and is reported.
+    if (err && err.code === 'EADDRINUSE') {
+      log('another host already owns this address; exiting');
+      shutdown(0, 'duplicate host');
+      return;
+    }
     log('socket server error:', err.message);
     shutdown(1);
   });
@@ -883,18 +907,6 @@ function main() {
     log(`listening on ${socketPath}`);
   });
 
-  // A second host cannot share a named pipe name, and on Windows the name is
-  // FIXED because it cannot be discovered. Losing that race is the normal way a
-  // duplicate host exits: one bridge per user is all this was ever for, and a
-  // loser that kept running would listen at an address nobody looks at.
-  server.on('error', (err) => {
-    if (err && err.code === 'EADDRINUSE') {
-      log('another host already owns this address; exiting');
-      process.exit(0);
-    }
-    log(`socket server error: ${err && err.message}`);
-    process.exit(1);
-  });
 
   process.stdin.resume();
 }
