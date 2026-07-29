@@ -89,6 +89,19 @@ const MIRROR_PHASE_BUDGET_MS = 90 * 1000;
 // only to be abandoned mid-hydration, which costs the user a visible window and returns
 // nothing.
 const MIRROR_HOST_MIN_MS = 15 * 1000;
+// What an open-access retry through a tab may spend. Short: these hosts are not walled and
+// need no human, so a slow one is a dead one, and the mirrors are still waiting behind it.
+const OA_TAB_BUDGET_MS = 20 * 1000;
+// What the publisher phase may spend on ONE publisher.
+//
+// It used to inherit HUMAN_SOLVE_BUDGET_MS -- an hour -- on the reasoning that a human may be
+// clearing a Cloudflare challenge. Measured: Wiley, ACS and J Biotechnol each sat past two
+// minutes with a tab open and no challenge on screen, because the wait was for a human who
+// was never asked and never came. Three downloads hung and three tabs were left behind.
+//
+// Two minutes is long enough for a person who IS looking at a challenge to answer it, and
+// short enough that a paper nobody is watching fails rather than hanging forever.
+const PUBLISHER_BUDGET_MS = 120 * 1000;
 const RECONNECT_ALARM = 'corpus-retriever-reconnect';
 // Fires while the bridge is HEALTHY, so an evicted worker is revived. See connect().
 const HEARTBEAT_ALARM = 'corpus-retriever-heartbeat';
@@ -269,6 +282,51 @@ const ANONYMOUS_HOSTS = [
   'elifesciences.org',
   'zenodo.org',
   'osf.io',
+  // Broad open-access coverage, added 2026-07-30 after a measured failure: OpenAlex handed
+  // back a valid 2.16 MB PDF on genomebiology.biomedcentral.com, the tier check refused it,
+  // and the download spent eighteen seconds opening Sci-Hub, Anna's and LibGen tabs for a
+  // paper open access was giving away. The list above was too narrow to be useful.
+  //
+  // These are ANONYMOUS: credentialsFor still answers 'omit' for every one, so no cookie is
+  // ever sent to any of them. The grant is only "these bytes may be fetched at all".
+  //
+  // Deliberately wide, including hosts we have not yet needed. An OA resolver can name any
+  // repository that deposited a copy, so a list that only grows when a user reports a
+  // failure means every new publisher costs somebody a broken download first.
+  'biomedcentral.com', 'springeropen.com',
+  'science.org', 'hindawi.com',
+  'tandfonline.com', 'sagepub.com', 'journals.sagepub.com', 'cambridge.org',
+  'rsc.org', 'pubs.rsc.org', 'iop.org', 'iopscience.iop.org',
+  'aps.org', 'journals.aps.org', 'aip.org', 'pubs.aip.org', 'ieee.org',
+  'ieeexplore.ieee.org', 'acm.org', 'dl.acm.org', 'jstage.jst.go.jp',
+  'scielo.br', 'scielo.org', 'degruyter.com', 'karger.com', 'thieme-connect.de',
+  'emerald.com', 'inderscience.com', 'copernicus.org', 'pnas.org', 'www.pnas.org',
+  'jamanetwork.com', 'bmj.com', 'www.bmj.com', 'thelancet.com', 'nejm.org',
+  'ahajournals.org', 'physiology.org', 'asm.org', 'journals.asm.org',
+  'biologists.com', 'rupress.org', 'cshlp.org', 'embopress.org', 'jbc.org',
+  'jimmunol.org', 'haematologica.org', 'aacrjournals.org', 'ashpublications.org',
+  'jci.org',
+  // Repositories, preprint servers and aggregators.
+  'figshare.com', 'dryad.org', 'datadryad.org', 'chemrxiv.org',
+  'researchsquare.com', 'preprints.org', 'hal.science', 'archives-ouvertes.fr',
+  'semanticscholar.org', 'base-search.net', 'openaire.eu', 'dspace.mit.edu',
+  'escholarship.org', 'repec.org', 'econstor.eu', 'jstor.org',
+  // Repository SOFTWARE domains -- where most green OA actually lives.
+  'bepress.com', 'dspace.org', 'eprints.org', 'digitalcommons.net',
+  'contentdm.oclc.org',
+  // Object storage the above redirect into. A PDF very often ends up on one of these, and
+  // a grant that stops at the publisher's own domain dies at the redirect.
+  'cloudfront.net', 'amazonaws.com', 'blob.core.windows.net',
+  'storage.googleapis.com', 'figstatic.com',
+  // Measured 2026-07-30, the same way PLOS was found: a real download resolved to one of
+  // these and was refused, so the extension went off to open mirror tabs for a paper it
+  // already had. BioMedCentral hosts the whole BMC/Genome Biology family; science.org is
+  // where AAAS serves its own free-to-read PDFs.
+  'genomebiology.biomedcentral.com',
+  'biomedcentral.com',
+  'springeropen.com',
+  'www.science.org',
+  'science.org',
   // Open-access APIs and their download hosts.
   'api.unpaywall.org',
   'api.openalex.org',
@@ -1249,6 +1307,39 @@ async function withClearedTab(landing, body, budgetMs = HUMAN_SOLVE_BUDGET_MS) {
   }
 }
 
+/**
+ * Wait for a download Chrome started by itself to finish, and report it.
+ *
+ * Used when a navigation became a download and took its tab with it. Bounded: a download
+ * that has not begun moving is not one this call caused, and waiting on it would hold the
+ * ladder open for a file nobody asked for.
+ */
+async function waitForStrayDownload(ids, timeoutMs = 120000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    for (const id of ids) {
+      let item = null;
+      try {
+        const found = await new Promise((r) => chrome.downloads.search({ id }, r));
+        item = found && found[0];
+      } catch {
+        continue;
+      }
+      if (!item) continue;
+      if (item.state === 'complete') {
+        return {
+          id,
+          bytes: item.fileSize || item.totalBytes || 0,
+          filename: (item.filename || '').split(/[\\/]/).pop() || null,
+        };
+      }
+      if (item.state === 'interrupted') return null;
+    }
+    await new Promise((r) => setTimeout(r, 400));
+  }
+  return null;
+}
+
 /** Fetches the PDF from inside a cleared tab on its own origin. */
 async function fetchPdf({ url, referer, budgetMs }) {
   // urlTier, not isAllowedUrl: the latter answers only for the CREDENTIALED grant, so an
@@ -1280,7 +1371,7 @@ async function fetchPdf({ url, referer, budgetMs }) {
   chrome.downloads.onCreated.addListener(noteStray);
 
   try {
-  return await withClearedTab(landing, async (tabId, deadline, expectedOrigin, requestUrl) => {
+  const out = await withClearedTab(landing, async (tabId, deadline, expectedOrigin, requestUrl) => {
     // One attempt: try in the page, and fall back to the worker when the page refuses
     // a cross-origin hop. Both paths are needed on every attempt, not just the first --
     // the in-page fetch is what carries the cleared session, but a redirect off-origin
@@ -1476,6 +1567,25 @@ async function fetchPdf({ url, referer, budgetMs }) {
     }
     return result;
   }, budgetMs);
+
+  // A tab that VANISHED because Chrome turned the navigation into a download is not a
+  // failure -- the bytes are arriving, and this call is what asked for them. LibGen's
+  // get.php answers with a Content-Disposition, so Chrome takes the response over and
+  // destroys the tab; reporting that as "page did not clear" threw away a download already
+  // in progress and sent the ladder off to open tabs on the next source instead.
+  //
+  // `strays` is the set of downloads Chrome began while this call was navigating, so it is
+  // the evidence: a tab that disappeared with one in flight disappeared FOR it.
+  if (!out.ok && /tab-gone/.test(out.error || '') && strays.size > 0) {
+    const saved = await waitForStrayDownload(strays);
+    if (saved) {
+      devMark('tab:became-download', { url, bytes: saved.bytes });
+      // Claimed, so the finally below must not erase it as an unwanted stray.
+      strays.delete(saved.id);
+      return { ok: true, savedByBrowser: true, filename: saved.filename, bytes: saved.bytes };
+    }
+  }
+  return out;
   } finally {
     chrome.downloads.onCreated.removeListener(noteStray);
     // Erase, do not merely forget. The bytes this function returns are saved deliberately by
@@ -1851,6 +1961,21 @@ async function runDownload(request) {
       paperTitle(request.doi),
     ]);
     if (!got.ok) return { ok: false, error: got.error, attempts: got.attempts };
+    // Already on disk: Chrome turned a navigation into a download and saved the file itself.
+    // Saving again would put a duplicate in the user's Downloads folder, and there are no
+    // bytes here to save in any case -- the response never came back through the worker.
+    // The name is Chrome's rather than the paper's title, which is the cost of not having
+    // the bytes; a correct file under a plain name beats no file.
+    if (got.savedByBrowser) {
+      return {
+        ok: true,
+        filename: got.filename || null,
+        bytes: got.bytes,
+        source: got.source,
+        title: title || null,
+        savedByBrowser: true,
+      };
+    }
     const filename = pdfFilename(title, request.doi, request.pdfUrl);
     const saved = await downloadToBrowser(got.base64, filename);
     if (!saved.ok) return { ok: false, error: saved.error, attempts: got.attempts };
@@ -1948,9 +2073,46 @@ async function retrievePaper({ doi, pdfUrl, email, coreApiKey }) {
   const raced = await Promise.all(cheap.map(async (c) => {
     const r = await fetchValidatedPdf(c.url);
     if (!r.ok) attempts.push({ source: c.source, error: r.error });
-    return r.ok ? { ...c, buf: r.buf } : null;
+    // Carry the failure with the CANDIDATE. Looking it up in `attempts` afterwards matched
+    // whichever entry that source pushed first -- PMC's "not a pdf" masked the refusals the
+    // retry below actually exists for, so the retry never ran.
+    return r.ok ? { ...c, buf: r.buf } : { ...c, failed: r.error || 'unknown' };
   }));
-  const oaWin = raced.find(Boolean);
+  const oaWin = raced.find((r) => r && r.buf);
+
+  // A worker fetch that was REFUSED, retried through a tab.
+  //
+  // An open-access url is vouched for by Unpaywall or OpenAlex, but it routinely redirects
+  // to a host nobody enumerated -- BioMedCentral's /counter/pdf/ lands on link.springer.com
+  // -- and host_permissions does not extend across a redirect. The worker then reports a
+  // bare "TypeError: Failed to fetch" and the paper falls through to the mirrors, which is
+  // how a download that could have finished in two seconds spent eighteen opening tabs on
+  // Sci-Hub, Anna's and LibGen for a paper open access was giving away.
+  //
+  // The tab is not bound by CORS and follows the redirect as an ordinary navigation. This is
+  // the same escalation the walled publishers already use; open access simply never needed
+  // it until the resolvers started handing back redirecting urls.
+  //
+  // Only for a REFUSAL, and only when the url is one an OA API named. A 404 or a non-pdf
+  // body is a real answer and is not retried -- opening a tab for those would be the tab
+  // spam this file spends most of its length preventing.
+  if (!oaWin) {
+    for (const c of raced) {
+      if (!c || !c.failed) continue;
+      // Only a REFUSAL is retried. A 404 or an html body is a real answer, and opening a tab
+      // for those would be the tab spam this file spends most of its length preventing.
+      if (!/Failed to fetch|host not allowlisted/i.test(c.failed)) continue;
+      devStart(`oa-tab:${c.source}`);
+      const viaTab = await fetchPdf({ url: c.url, budgetMs: OA_TAB_BUDGET_MS });
+      devEnd(`oa-tab:${c.source}`, { ok: Boolean(viaTab.ok) });
+      if (viaTab.ok && viaTab.base64) {
+        return {
+          ok: true, source: c.source, url: c.url,
+          base64: viaTab.base64, bytes: viaTab.bytes, attempts,
+        };
+      }
+    }
+  }
   devEnd('phase:openaccess', { tried: cheap.length, won: oaWin ? oaWin.source : null });
   if (oaWin) return deliver(oaWin.source, oaWin.url, oaWin.buf);
 
@@ -2096,9 +2258,14 @@ async function retrievePaper({ doi, pdfUrl, email, coreApiKey }) {
           referer: `https://${new URL(u).host}/`,
           budgetMs: remaining,
         });
-        return out.ok && out.base64
-          ? { ok: true, base64: out.base64, bytes: out.bytes }
-          : { ok: false, error: out.error || 'libgen produced no pdf' };
+        if (out.ok && out.base64) return { ok: true, base64: out.base64, bytes: out.bytes };
+        // Chrome took the response over and saved it itself. The file IS on disk and this
+        // call is what asked for it, so the paper is retrieved even though no bytes came
+        // back through the worker. The caller is told so it does not save a second copy.
+        if (out.ok && out.savedByBrowser) {
+          return { ok: true, savedByBrowser: true, filename: out.filename, bytes: out.bytes };
+        }
+        return { ok: false, error: out.error || 'libgen produced no pdf' };
       }],
     ];
     // A confirmed hit goes to the front of its own phase; everything else keeps its measured
@@ -2128,6 +2295,15 @@ async function retrievePaper({ doi, pdfUrl, email, coreApiKey }) {
         const r = await run();
         devEnd(`mirror:${name}`, { ok: Boolean(r.ok), error: r.ok ? undefined : r.error });
         if (r.ok && r.buf) return deliver(name, 'mirror', r.buf);
+        // Saved by the browser rather than handed back as bytes. Still a win, and the ladder
+        // must stop -- continuing would open more tabs for a paper already on disk, which is
+        // exactly the "it kept opening websites after the download" report.
+        if (r.ok && r.savedByBrowser) {
+          return {
+            ok: true, source: name, url: 'mirror', savedByBrowser: true,
+            filename: r.filename, bytes: r.bytes, attempts,
+          };
+        }
         // The tab path returns base64 already encoded rather than an ArrayBuffer.
         if (r.ok && r.base64) {
           return { ok: true, source: name, url: 'mirror', base64: r.base64, bytes: r.bytes, attempts };
@@ -2162,11 +2338,11 @@ async function retrievePaper({ doi, pdfUrl, email, coreApiKey }) {
           const landing = entry.landingUrl(id);
           const direct = entry.pdfUrl(id);
           const out = direct
-            ? await fetchPdf({ url: direct, referer: landing })
+            ? await fetchPdf({ url: direct, referer: landing, budgetMs: PUBLISHER_BUDGET_MS })
             // No constructible pdf url (Mendeley, OUP, ACS): read the link out of the
             // rendered page, then fetch it down the ordinary path.
             : await (async () => {
-              const links = await fetchLinks({ url: landing });
+              const links = await fetchLinks({ url: landing, budgetMs: PUBLISHER_BUDGET_MS });
               if (!links.ok || !links.links.length) {
                 return { ok: false, error: links.error || 'no pdf links on the page' };
               }

@@ -247,6 +247,51 @@ const ANONYMOUS_HOSTS = [
   'elifesciences.org',
   'zenodo.org',
   'osf.io',
+  // Broad open-access coverage, added 2026-07-30 after a measured failure: OpenAlex handed
+  // back a valid 2.16 MB PDF on genomebiology.biomedcentral.com, the tier check refused it,
+  // and the download spent eighteen seconds opening Sci-Hub, Anna's and LibGen tabs for a
+  // paper open access was giving away. The list above was too narrow to be useful.
+  //
+  // These are ANONYMOUS: credentialsFor still answers 'omit' for every one, so no cookie is
+  // ever sent to any of them. The grant is only "these bytes may be fetched at all".
+  //
+  // Deliberately wide, including hosts we have not yet needed. An OA resolver can name any
+  // repository that deposited a copy, so a list that only grows when a user reports a
+  // failure means every new publisher costs somebody a broken download first.
+  'biomedcentral.com', 'springeropen.com',
+  'science.org', 'hindawi.com',
+  'tandfonline.com', 'sagepub.com', 'journals.sagepub.com', 'cambridge.org',
+  'rsc.org', 'pubs.rsc.org', 'iop.org', 'iopscience.iop.org',
+  'aps.org', 'journals.aps.org', 'aip.org', 'pubs.aip.org', 'ieee.org',
+  'ieeexplore.ieee.org', 'acm.org', 'dl.acm.org', 'jstage.jst.go.jp',
+  'scielo.br', 'scielo.org', 'degruyter.com', 'karger.com', 'thieme-connect.de',
+  'emerald.com', 'inderscience.com', 'copernicus.org', 'pnas.org', 'www.pnas.org',
+  'jamanetwork.com', 'bmj.com', 'www.bmj.com', 'thelancet.com', 'nejm.org',
+  'ahajournals.org', 'physiology.org', 'asm.org', 'journals.asm.org',
+  'biologists.com', 'rupress.org', 'cshlp.org', 'embopress.org', 'jbc.org',
+  'jimmunol.org', 'haematologica.org', 'aacrjournals.org', 'ashpublications.org',
+  'jci.org',
+  // Repositories, preprint servers and aggregators.
+  'figshare.com', 'dryad.org', 'datadryad.org', 'chemrxiv.org',
+  'researchsquare.com', 'preprints.org', 'hal.science', 'archives-ouvertes.fr',
+  'semanticscholar.org', 'base-search.net', 'openaire.eu', 'dspace.mit.edu',
+  'escholarship.org', 'repec.org', 'econstor.eu', 'jstor.org',
+  // Repository SOFTWARE domains -- where most green OA actually lives.
+  'bepress.com', 'dspace.org', 'eprints.org', 'digitalcommons.net',
+  'contentdm.oclc.org',
+  // Object storage the above redirect into. A PDF very often ends up on one of these, and
+  // a grant that stops at the publisher's own domain dies at the redirect.
+  'cloudfront.net', 'amazonaws.com', 'blob.core.windows.net',
+  'storage.googleapis.com', 'figstatic.com',
+  // Measured 2026-07-30, the same way PLOS was found: a real download resolved to one of
+  // these and was refused, so the extension went off to open mirror tabs for a paper it
+  // already had. BioMedCentral hosts the whole BMC/Genome Biology family; science.org is
+  // where AAAS serves its own free-to-read PDFs.
+  'genomebiology.biomedcentral.com',
+  'biomedcentral.com',
+  'springeropen.com',
+  'www.science.org',
+  'science.org',
   // Open-access APIs and their download hosts.
   'api.unpaywall.org',
   'api.openalex.org',
