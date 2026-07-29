@@ -653,6 +653,70 @@ function inPageFetch(url, maxBytes, credentials, timeoutMs) {
  * held a tab for 48.7s on a settled page whose file link was never going to appear, inside
  * a phase meant to last 90.
  */
+/**
+ * Solve Sci-Hub's ALTCHA proof-of-work FROM INSIDE THE TAB.
+ *
+ * ALTCHA is a hashcash, not a puzzle: the page is handed a salt and a target SHA-256 and
+ * must find the integer n where sha256(salt + n) matches. Measured live: maxNumber is
+ * 200000 and the answer lands in ~100ms. There is no image and nothing for a human to look
+ * at, so waiting for one was always the wrong shape.
+ *
+ * IN THE TAB, deliberately, and not in the worker. Sci-Hub is ANONYMOUS tier, so
+ * credentialsFor gives the worker `omit` -- it can solve the challenge and then throws away
+ * the session cookie the solution sets, so the very next fetch is challenged again. Measured
+ * exactly that: solve returned true, the re-fetch came back 7313B and still challenged. The
+ * tab has its own cookie jar, so the solve sticks there without granting the worker cookies
+ * for a host the allowlist deliberately keeps at arm's length.
+ *
+ * The submission shape was read out of the page's own handler and is not the documented one:
+ * a JSON body `{captcha: <base64>}`, not the form-encoded `altcha=` ALTCHA describes. The
+ * documented shape returns 200 with {"success":false}.
+ *
+ * Runs in the PAGE, so it may use only what the page has. Returns a short status string.
+ */
+function inPageSolveAltcha() {
+  const widget = document.querySelector('altcha-widget');
+  if (!widget) return 'no-widget';
+  const cu = widget.getAttribute('challengeurl');
+  if (!cu) return 'no-challengeurl';
+  const idm = /\/captcha\/challenge\/(\d+)/.exec(cu);
+  if (!idm) return 'no-id';
+
+  return (async () => {
+    try {
+      const ch = await (await fetch(cu, { credentials: 'include' })).json();
+      if (!ch || ch.algorithm !== 'SHA-256') return 'bad-challenge';
+      const enc = new TextEncoder();
+      const cap = Number.isFinite(ch.maxNumber) ? Math.min(ch.maxNumber, 1e6) : 200000;
+      let n = null;
+      for (let i = 0; i <= cap; i += 1) {
+        const buf = await crypto.subtle.digest('SHA-256', enc.encode(ch.salt + i));
+        const hex = [...new Uint8Array(buf)].map((b) => b.toString(16).padStart(2, '0')).join('');
+        if (hex === ch.challenge) { n = i; break; }
+      }
+      if (n === null) return 'unsolved';
+      const payload = btoa(JSON.stringify({
+        algorithm: ch.algorithm,
+        challenge: ch.challenge,
+        number: n,
+        salt: ch.salt,
+        signature: ch.signature,
+      }));
+      const post = await fetch(`/captcha/solution/${idm[1]}`, {
+        method: 'POST',
+        credentials: 'include',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ captcha: payload }),
+      });
+      if (!post.ok) return `http-${post.status}`;
+      const v = await post.json();
+      return v && v.success ? 'solved' : 'rejected';
+    } catch (err) {
+      return `threw-${err.name}`;
+    }
+  })();
+}
+
 function inPageSettled() {
   return {
     ready: document.readyState === 'complete',
@@ -739,6 +803,14 @@ function pageIsCleared(expectedOrigin) {
   const t = document.title || '';
   if (/just a moment|attention required|verifying|are you a robot|enable javascript and cookies/i.test(t)) return 'challenge:cf-title';
   if (document.querySelector('#challenge-form, #cf-challenge-running, .cf-browser-verification')) return 'challenge:cf';
+  // ALTCHA, reported separately from the Cloudflare family because it is the one challenge
+  // the extension can answer itself -- see the inPageSolveAltcha branch in waitForTabCleared.
+  // The widget alone is not enough: sci-hub loads it on article pages too, so this asks
+  // whether the page is ACTUALLY holding a challenge open.
+  if (document.querySelector('altcha-widget[challengeurl]')
+      && !document.querySelector('a[href*="/storage/"], embed[src*=".pdf"], iframe[src*=".pdf"]')) {
+    return 'challenge:altcha';
+  }
   // Cloudflare's INTERACTIVE variant as ScienceDirect serves it: embedded inside Elsevier's
   // own page chrome, so the title is just "ScienceDirect" and NONE of the markers around
   // this line match. Measured 2026-07-28 on a 403/1.2 MB article response: _cf_chl_opt,
@@ -826,6 +898,9 @@ function waitForTabCleared(tabId, deadline, expectedOrigin, opts = {}) {
   return new Promise((resolve) => {
     let surfaced = false;
     let reason = 'unknown';
+    // One attempt per wait. A second solve on the same page means the first was not the
+    // reason it is stuck, and re-solving would spin instead of surfacing to a human.
+    let altchaTried = false;
     let scriptingRefusedSince = null;
     const poll = async () => {
       if (Date.now() > deadline) return resolve({ cleared: false, reason, surfaced });
@@ -847,6 +922,25 @@ function waitForTabCleared(tabId, deadline, expectedOrigin, opts = {}) {
           reason = r.result;
           if (reason === 'cleared') return resolve({ cleared: true, reason, surfaced });
           scriptingRefusedSince = null;
+          // A hashcash the extension can answer itself, before any human is troubled.
+          //
+          // Only for this one reason, and only once: ALTCHA has no image and no puzzle, so
+          // solving it is arithmetic rather than an imposition. Every other challenge state
+          // still surfaces the tab for a person, because Cloudflare and friends genuinely
+          // want a human.
+          if (reason === 'challenge:altcha' && !altchaTried) {
+            altchaTried = true;
+            try {
+              const [sr] = await chrome.scripting.executeScript({
+                target: { tabId }, func: inPageSolveAltcha,
+              });
+              devMark('altcha', { result: sr && sr.result });
+              // Solved: the page needs to be re-requested for the article to render.
+              if (sr && sr.result === 'solved') await chrome.tabs.reload(tabId);
+            } catch {
+              // Tab navigating or gone; the ordinary polling below handles it.
+            }
+          }
         }
         // The origin pin exists so a tab still on about:blank is not mistaken for the
         // loaded page. It must NOT outlive a handoff the ORIGIN chose: ScienceDirect's
@@ -1828,8 +1922,37 @@ async function retrievePaper({ doi, pdfUrl, email, coreApiKey }) {
     attempts,
   });
 
+  // PHASE 1 -- cheap and parallel: a direct url the caller already has, plus every OA API.
+  // None of these opens a tab or involves a human.
+  const cheap = [];
+  if (pdfUrl && urlTier(pdfUrl) !== TIER.NONE) cheap.push({ source: 'direct', url: pdfUrl });
+  // A refused url must SAY it was refused. Dropped silently, a pasted link to a host the
+  // extension does not carry ends as a bare "no source produced a valid pdf" with an empty
+  // attempts log, which reads as "the paper does not exist" rather than "I will not go there".
+  else if (pdfUrl) attempts.push({ source: 'direct', error: 'host not allowlisted' });
+  if (doi && email) {
+    try {
+      for (const c of await resolveOaCandidates(doi, { email, coreApiKey })) {
+        if (c.pdfUrl && urlTier(c.pdfUrl) !== TIER.NONE) {
+          cheap.push({ source: c.source, url: c.pdfUrl });
+        }
+      }
+    } catch (err) {
+      attempts.push({ source: 'oa', error: `${err.name}: ${err.message}` });
+    }
+  }
+  devStart('phase:openaccess');
+  const raced = await Promise.all(cheap.map(async (c) => {
+    const r = await fetchValidatedPdf(c.url);
+    if (!r.ok) attempts.push({ source: c.source, error: r.error });
+    return r.ok ? { ...c, buf: r.buf } : null;
+  }));
+  const oaWin = raced.find(Boolean);
+  devEnd('phase:openaccess', { tried: cheap.length, won: oaWin ? oaWin.source : null });
+  if (oaWin) return deliver(oaWin.source, oaWin.url, oaWin.buf);
+
   // ---8<--- mirror phase (stripped for the store build) ---8<---
-  // PHASE 1 -- mirrors, first. They hold the paywalled majority, they answer without a
+  // PHASE 2 -- mirrors. They hold the paywalled majority, and they answer without a
   // challenge and without a human, and they cost nothing when they miss.
   //
   // Bounded as a GROUP, not just per source: three sources at 45s each is over two minutes
@@ -1884,7 +2007,7 @@ async function retrievePaper({ doi, pdfUrl, email, coreApiKey }) {
             return { ok: false, error: 'mirror phase budget exhausted' };
           }
           const page = scihubArticleUrl(host, doi);
-          const body = await getTextMirror(page, PROBE_TIMEOUT_MS_MIRROR);
+          let body = await getTextMirror(page, PROBE_TIMEOUT_MS_MIRROR);
           // Host down, or rate-limiting: try the next one, still without a tab.
           if (body === null) continue;
           // Skip ONLY on a definitive "not in my database" answer.
@@ -2024,36 +2147,6 @@ async function retrievePaper({ doi, pdfUrl, email, coreApiKey }) {
     clearMirrorPhaseDeadline(mirrorDeadline);
   }
   // ---8<--- end mirror phase ---8<---
-
-  // PHASE 2 -- cheap and parallel: a direct url the caller already has, plus every OA API.
-  // None of these opens a tab or involves a human.
-  const cheap = [];
-  if (pdfUrl && urlTier(pdfUrl) !== TIER.NONE) cheap.push({ source: 'direct', url: pdfUrl });
-  // A refused url must SAY it was refused. Dropped silently, a pasted link to a host the
-  // extension does not carry ends as a bare "no source produced a valid pdf" with an empty
-  // attempts log, which reads as "the paper does not exist" rather than "I will not go there".
-  else if (pdfUrl) attempts.push({ source: 'direct', error: 'host not allowlisted' });
-  if (doi && email) {
-    try {
-      for (const c of await resolveOaCandidates(doi, { email, coreApiKey })) {
-        if (c.pdfUrl && urlTier(c.pdfUrl) !== TIER.NONE) {
-          cheap.push({ source: c.source, url: c.pdfUrl });
-        }
-      }
-    } catch (err) {
-      attempts.push({ source: 'oa', error: `${err.name}: ${err.message}` });
-    }
-  }
-  devStart('phase:openaccess');
-  const raced = await Promise.all(cheap.map(async (c) => {
-    const r = await fetchValidatedPdf(c.url);
-    if (!r.ok) attempts.push({ source: c.source, error: r.error });
-    return r.ok ? { ...c, buf: r.buf } : null;
-  }));
-  const oaWin = raced.find(Boolean);
-  devEnd('phase:openaccess', { tried: cheap.length, won: oaWin ? oaWin.source : null });
-  if (oaWin) return deliver(oaWin.source, oaWin.url, oaWin.buf);
-
   // PHASE 3 -- the publisher that owns this DOI, if any. May open a tab, may wait on a human.
   if (doi) {
     const entry = await findPublisher(doi, pdfUrl || null).catch(() => null);
