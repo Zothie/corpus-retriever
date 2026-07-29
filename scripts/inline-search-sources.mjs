@@ -52,6 +52,7 @@ function inlinable(file, importLine = '') {
 
 const IMPORT = "import { credentialsFor } from './allowlist.js';";
 const inlined = [
+  inlinable('extension/devlog.js'),
   inlinable('extension/search-sources.js', IMPORT),
   inlinable('extension/oa-sources.js', IMPORT),
   // NOT fenced, and deliberately names no mirror: it reads the mirror list from the fenced

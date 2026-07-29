@@ -645,6 +645,26 @@ function inPageFetch(url, maxBytes, credentials, timeoutMs) {
  *
  * Serialised into the frame by chrome.scripting, so it closes over nothing.
  */
+/**
+ * Has this page finished, and does it hold anything at all?
+ *
+ * Separate from inPagePdfLinks because the harvest cannot tell "still hydrating" from
+ * "hydrated, holds nothing" -- and that difference is worth 45 seconds. Measured: Anna's
+ * held a tab for 48.7s on a settled page whose file link was never going to appear, inside
+ * a phase meant to last 90.
+ */
+function inPageSettled() {
+  return {
+    ready: document.readyState === 'complete',
+    anchors: document.querySelectorAll('a[href]').length,
+    // Whether the page is still fetching. A scidb page that has finished its own XHRs and
+    // still shows no file is finished for our purposes, whatever else it renders.
+    pending: typeof performance !== 'undefined' && performance.getEntriesByType
+      ? performance.getEntriesByType('resource').filter((r) => !r.responseEnd).length
+      : 0,
+  };
+}
+
 function inPagePdfLinks(maxRaw, maxChars) {
   const out = [];
   const anchors = document.querySelectorAll('a[href]');
@@ -1044,6 +1064,7 @@ async function withClearedTab(landing, body, budgetMs = HUMAN_SOLVE_BUDGET_MS) {
     // Background tab: most fetches clear without a challenge, and stealing focus on every
     // download would be intolerable while the user is working. waitForTabCleared owns the
     // decision to surface it -- see the focus rule documented there.
+    devMark('tab:open', { url: landing, budgetMs });
     const tab = await chrome.tabs.create({ url: landing, active: false });
     tabId = tab.id;
     owned.add(tabId);
@@ -1829,7 +1850,9 @@ async function retrievePaper({ doi, pdfUrl, email, coreApiKey }) {
     // skipped, so a probe that learned nothing costs the ladder nothing but the wait.
     let hints = { has: {}, ruledOut: [] };
     if (doi) {
+      devStart('probe');
       hints = await probeAvailability(doi, { email, coreApiKey });
+      devEnd('probe', { has: Object.keys(hints.has), ruledOut: hints.ruledOut });
       // The same headroom idiom the loop below uses. A probe that walked the mirrors long
       // enough to spend the phase has left nothing to reorder, and acting on its hints would
       // then skip sources on evidence the ladder no longer has time to overturn. So an
@@ -1896,6 +1919,15 @@ async function retrievePaper({ doi, pdfUrl, email, coreApiKey }) {
             const r = await fetchValidatedPdf(pick, { timeoutMs: 45000 });
             if (r.ok) return r;
           }
+          // ONE tab for sci-hub, not one per host.
+          //
+          // The page said it had the file, we opened it, and it did not produce one. The next
+          // mirror serves the same corpus from the same index, so it is unlikely to differ --
+          // and measured, walking them cost 48s of the phase's 90 for nothing. Hosts that
+          // answer with no file at all are still walked freely above; only the expensive step
+          // is capped.
+          devMark('scihub:tab-spent', { host });
+          break;
         }
         return { ok: false, error: 'no sci-hub mirror served it' };
       }],
@@ -1966,7 +1998,9 @@ async function retrievePaper({ doi, pdfUrl, email, coreApiKey }) {
         continue;
       }
       try {
+        devStart(`mirror:${name}`);
         const r = await run();
+        devEnd(`mirror:${name}`, { ok: Boolean(r.ok), error: r.ok ? undefined : r.error });
         if (r.ok && r.buf) return deliver(name, 'mirror', r.buf);
         // The tab path returns base64 already encoded rather than an ArrayBuffer.
         if (r.ok && r.base64) {
@@ -2010,12 +2044,14 @@ async function retrievePaper({ doi, pdfUrl, email, coreApiKey }) {
       attempts.push({ source: 'oa', error: `${err.name}: ${err.message}` });
     }
   }
+  devStart('phase:openaccess');
   const raced = await Promise.all(cheap.map(async (c) => {
     const r = await fetchValidatedPdf(c.url);
     if (!r.ok) attempts.push({ source: c.source, error: r.error });
     return r.ok ? { ...c, buf: r.buf } : null;
   }));
   const oaWin = raced.find(Boolean);
+  devEnd('phase:openaccess', { tried: cheap.length, won: oaWin ? oaWin.source : null });
   if (oaWin) return deliver(oaWin.source, oaWin.url, oaWin.buf);
 
   // PHASE 3 -- the publisher that owns this DOI, if any. May open a tab, may wait on a human.
@@ -2093,10 +2129,19 @@ async function fetchLinks({ url, budgetMs }) {
   const origin = new URL(url).origin;
 
   return withClearedTab(url, async (tabId, deadline, expectedOrigin) => {
-    const hydrationDeadline = Date.now() + HYDRATION_TIMEOUT_MS;
+    // Bounded by the CALLER's budget as well as by the hydration default.
+    //
+    // Measured end to end: Anna's held a tab for 48.7 seconds on a page whose links never
+    // appeared, inside a mirror phase that is supposed to last 90 -- while open access
+    // delivered the same paper in 427ms. The 45s default exists for a publisher page a human
+    // may be clearing; no human is waiting on a mirror, and the caller already computed how
+    // much of the phase is left.
+    const hydrationDeadline = Date.now()
+      + Math.min(HYDRATION_TIMEOUT_MS, typeof budgetMs === 'number' ? budgetMs : Infinity);
     // Poll rather than read once: the page hydrates after load, so the first read
     // legitimately finds nothing. Bounded by the same challenge budget the clear
     // used, so the total stays under the callers' timeouts.
+    let settledEmpty = 0;
     for (;;) {
       let raw = [];
       try {
@@ -2136,6 +2181,36 @@ async function fetchLinks({ url, budgetMs }) {
         links.push(href);
       }
       if (links.length > 0) return { ok: true, links };
+
+      // GIVE UP EARLY on a page that has finished and holds no file link.
+      //
+      // Polling to the deadline only makes sense while the page might still produce one.
+      // Once it is complete, has anchors (so it rendered something rather than nothing) and
+      // has no requests in flight, a link that has not appeared is not going to. Confirmed
+      // twice before quitting, because a hydration can swap the document between reads and
+      // a single sample can catch the gap.
+      try {
+        const [sr] = await chrome.scripting.executeScript({
+          target: { tabId }, func: inPageSettled,
+        });
+        const st = sr && sr.result;
+        if (st && st.ready && st.anchors > 0 && st.pending === 0) {
+          settledEmpty += 1;
+          if (settledEmpty >= 2) {
+            devMark('hydration:settled-empty', { anchors: st.anchors, url });
+            return {
+              ok: false,
+              error: `the page settled with no pdf link (${st.anchors} anchors, `
+                + `${raw.length} raw hrefs)`,
+            };
+          }
+        } else {
+          settledEmpty = 0;
+        }
+      } catch {
+        // Tab navigating: that is hydration, so keep polling.
+        settledEmpty = 0;
+      }
       // `deadline` is the hour-long human budget, far too long to bound hydration polling:
       // this loop would spin for an hour with no error and nothing to diagnose. Hydration
       // is a page finishing its own render, which no human is involved in, so it gets its
@@ -2478,6 +2553,72 @@ try {
 // silently, taking the bridge socket with it. That failure already cost several reload
 // cycles once. chrome-extension/search-sources.js remains the editable copy and is what the
 // tests import; tests/search-parity.test.mjs asserts the two stay identical.
+
+// Timing and tracing for the worker, off by default.
+//
+// WHY THIS EXISTS. Every investigation so far has meant writing a throwaway harness to bolt
+// timers onto the ladder, because the worker's 13 console calls carry no timings and no
+// phase boundaries. That is how a 66-second download was reported as "works": the parts all
+// passed and nobody could see where the seconds went. With this on, one run said probe=759ms
+// / retrieve=58s and the real problem was obvious immediately.
+//
+// OFF BY DEFAULT, and the check is a plain boolean read, so a disabled call costs one branch.
+// Turn it on from the worker console or a test:
+//
+//   chrome.storage.session.set({ devlog: true })   // survives worker eviction
+//   devlog.enabled = true                          // this worker only, immediate
+//
+// Deliberately NOT wired to a build flag: the bug that matters is usually in the user's own
+// browser with the shipped build, and asking them to reinstall a debug build to reproduce it
+// is how a report goes cold.
+
+const devlog = {
+  enabled: false,
+  // Marks for the retrieval in progress, so a whole download reads as one table rather than
+  // interleaved lines. Keyed by nothing: one retrieval at a time is the normal case, and a
+  // second concurrent one simply appends -- its label carries the doi.
+  marks: [],
+  t0: 0,
+};
+
+/** Start a timed span. Returns the label so callers can pass it straight to `devEnd`. */
+function devStart(label) {
+  if (!devlog.enabled) return label;
+  if (!devlog.t0) devlog.t0 = Date.now();
+  devlog.marks.push({ label, at: Date.now() - devlog.t0, phase: 'start' });
+  return label;
+}
+
+/** Close a span opened with `devStart`, recording how long it took. */
+function devEnd(label, detail) {
+  if (!devlog.enabled) return;
+  const started = [...devlog.marks].reverse().find((m) => m.label === label && m.phase === 'start');
+  const at = Date.now() - devlog.t0;
+  devlog.marks.push({
+    label, at, phase: 'end', ms: started ? at - started.at : null, detail,
+  });
+  const ms = started ? `${at - started.at}ms` : '?';
+  console.log(`[devlog] ${label} ${ms}${detail ? ` ${JSON.stringify(detail)}` : ''}`);
+}
+
+/** A point event -- a decision taken, a source skipped, a tab opened. */
+function devMark(label, detail) {
+  if (!devlog.enabled) return;
+  if (!devlog.t0) devlog.t0 = Date.now();
+  const at = Date.now() - devlog.t0;
+  devlog.marks.push({ label, at, phase: 'mark', detail });
+  console.log(`[devlog] ${label} @${at}ms${detail ? ` ${JSON.stringify(detail)}` : ''}`);
+}
+
+/** Everything recorded since the last reset, for a test or the console to read back. */
+function devReport() {
+  return { totalMs: devlog.t0 ? Date.now() - devlog.t0 : 0, marks: devlog.marks };
+}
+
+function devReset() {
+  devlog.marks = [];
+  devlog.t0 = 0;
+}
 
 // Every source returns this shape, so a caller never branches on which database answered.
 // Fields a given source cannot supply are null rather than absent, so consumers can read
