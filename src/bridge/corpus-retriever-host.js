@@ -650,6 +650,14 @@ function main() {
             pdfUrl: typeof parsed.pdfUrl === 'string' ? parsed.pdfUrl.slice(0, 2000) : undefined,
             email: typeof parsed.email === 'string' ? parsed.email.slice(0, 200) : undefined,
             coreApiKey: typeof parsed.coreApiKey === 'string' ? parsed.coreApiKey.slice(0, 200) : undefined,
+            // Which sources may run. Names only, capped and string-checked -- they select
+            // from a fixed ladder, they cannot introduce one.
+            only: Array.isArray(parsed.only)
+              ? parsed.only.filter((x) => typeof x === 'string').slice(0, 20).map((x) => x.slice(0, 40))
+              : undefined,
+            skip: Array.isArray(parsed.skip)
+              ? parsed.skip.filter((x) => typeof x === 'string').slice(0, 20).map((x) => x.slice(0, 40))
+              : undefined,
           });
           continue;
         }

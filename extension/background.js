@@ -826,6 +826,39 @@ function inPageSolveAltcha() {
  * between a challenge and the article for one url, so evidence gathered afterwards is
  * evidence about a different page.
  */
+/**
+ * Fetch a url from inside the page and hand back base64.
+ *
+ * For a link the PAGE rendered on a host nobody can allowlist. Anna's serves its files from
+ * a random per-request CDN (measured: b4mcx2ml.net), so there is no fixed host to grant and
+ * the worker must not fetch an arbitrary one. The tab already sits on Anna's own origin, the
+ * link came from that page, and the bytes never touch the worker's fetch stack.
+ *
+ * Chunked on the way to base64: a multi-megabyte apply() blows the call stack, which is the
+ * same reason the worker's own encoder chunks.
+ */
+function inPageFetchAsBase64(target, maxBytes) {
+  return (async () => {
+    try {
+      const res = await fetch(target, { credentials: 'include' });
+      if (!res.ok) return { ok: false, error: `http ${res.status}` };
+      const buf = await res.arrayBuffer();
+      if (buf.byteLength > maxBytes) return { ok: false, error: `too large (${buf.byteLength})` };
+      const bytes = new Uint8Array(buf);
+      if (bytes.length < 5) return { ok: false, error: 'too short' };
+      const magic = String.fromCharCode(...bytes.subarray(0, 5));
+      if (magic !== '%PDF-') return { ok: false, error: `not a pdf (${JSON.stringify(magic)})` };
+      let bin = '';
+      for (let i = 0; i < bytes.length; i += 0x8000) {
+        bin += String.fromCharCode.apply(null, bytes.subarray(i, i + 0x8000));
+      }
+      return { ok: true, base64: btoa(bin), bytes: bytes.length };
+    } catch (err) {
+      return { ok: false, error: `${err.name}: ${err.message}` };
+    }
+  })();
+}
+
 function inPageSnapshot() {
   const html = document.documentElement ? document.documentElement.outerHTML : '';
   return {
@@ -857,6 +890,9 @@ function inPageSettled() {
 
 function inPagePdfLinks(maxRaw, maxChars) {
   const out = [];
+  // Every href considered and turned down, so "no file link" can be diagnosed from the trace
+  // rather than by re-fetching the page and hoping it looks the same.
+  const rejected = [];
   const anchors = document.querySelectorAll('a[href]');
   for (let i = 0; i < anchors.length && i < maxRaw; i += 1) {
     // The .href property is already resolved against the document base, so a
@@ -882,16 +918,21 @@ function inPagePdfLinks(maxRaw, maxChars) {
     // is not mistaken for a PDF. What comes back is only a CANDIDATE: the caller fetches
     // it and the %PDF- check decides, which is what keeps a .csv or .zip in a mixed
     // dataset out of the vault.
-    const isPdfPath = /\.pdf$/i.test(u.pathname);
+    // `.pdf` at the END, or as a segment with more path after it. Anna's CDN url is
+    //   /d3/x/.../nature12373.pdf~/<token>/<long title>.pdf
+    // so the extension appears twice mid-path and the trailing segment is a filename, not an
+    // extension the origin cares about. Requiring it at the very end dropped the only real
+    // link on the page, and the tab reported "no file link" for every paper Anna's holds.
+    const isPdfPath = /\.pdf(?:$|[~/?#])/i.test(u.pathname) || /\.pdf$/i.test(u.pathname);
     const isMendeleyFile = /\/public-files\/.*\/file_downloaded$/i.test(u.pathname);
     // ScienceDirect's real PDF url is /pdfft carrying a per-article md5 token that only
     // the rendered page knows -- a constructed one returns the HTML article instead, so
     // the link has to be read from the DOM like Mendeley's.
     const isScienceDirectPdf = /\/pdfft$/i.test(u.pathname);
-    if (!isPdfPath && !isMendeleyFile && !isScienceDirectPdf) continue;
+    if (!isPdfPath && !isMendeleyFile && !isScienceDirectPdf) { rejected.push(href.slice(0, 90)); continue; }
     out.push(href);
   }
-  return out;
+  return { links: out, rejected: rejected.slice(0, 12), anchors: anchors.length };
 }
 
 /**
@@ -1237,7 +1278,7 @@ function waitForTabSettled(tabId, timeoutMs = 45000) {
 // the user opened.
 const tabsOwnedByAnyCall = new Set();
 
-async function withClearedTab(landing, body, budgetMs = HUMAN_SOLVE_BUDGET_MS) {
+async function withClearedTab(landing, body, budgetMs = HUMAN_SOLVE_BUDGET_MS, navigateTo = null) {
   let tabId = null;
   // Every tab this call is responsible for: the one created below, plus anything that tab
   // opens. A publisher handoff can arrive as a new tab rather than a navigation --
@@ -1367,10 +1408,17 @@ async function withClearedTab(landing, body, budgetMs = HUMAN_SOLVE_BUDGET_MS) {
     // session. That is the leak. The hour-long budget still outlasts any real captcha and
     // both peers' timeouts, and it guarantees cleanup.
     const deadline = Date.now() + budgetMs;
+    // Diagnostics only, and it must never change the outcome. A tab Chrome has already
+    // handed to its download manager cannot be scripted -- injecting into one throws
+    // "Cannot access contents of url", and letting that escape turned a libgen download that
+    // was working into an `unscriptable` failure. Swallow everything, record nothing on
+    // failure, and let the wait below reach its own verdict.
     try {
       const [s0] = await chrome.scripting.executeScript({ target: { tabId }, func: inPageSnapshot });
-      devSnap('tab:opened', s0 && s0.result);
-    } catch { /* not scriptable yet; the wait below reports what it finds */ }
+      if (s0 && s0.result) devSnap('tab:opened', s0.result);
+    } catch (err) {
+      devSnap('tab:opened', { unscriptable: String(err.message).slice(0, 60) });
+    }
     const clear = await waitForTabCleared(tabId, deadline, expectedOrigin);
     devDecide('tab:wait', clear.cleared ? 'cleared' : 'gave-up', clear.reason,
       { surfaced: clear.surfaced === true, nonScriptable: clear.nonScriptable === true,
@@ -1391,6 +1439,19 @@ async function withClearedTab(landing, body, budgetMs = HUMAN_SOLVE_BUDGET_MS) {
       return { ok: false, error: `page did not clear (${clear.reason})` };
     }
 
+    // A file the tab must NAVIGATE to rather than read. Used when the target serves no CORS
+    // headers and cannot be allowlisted: nothing may fetch it, but the browser can still
+    // download it. The tab dies as Chrome converts the navigation into a download, which the
+    // stray watcher in fetchPdf turns into the result.
+    if (navigateTo) {
+      requestUrl(navigateTo);
+      devMark('tab:navigate-to-file', { url: String(navigateTo).slice(0, 90) });
+      try {
+        await chrome.tabs.update(tabId, { url: navigateTo });
+      } catch { /* tab already gone: the download started */ }
+      await waitForTabSettled(tabId).catch(() => {});
+      return { ok: false, error: 'page did not clear (tab-gone)' };
+    }
     return await body(tabId, deadline, expectedOrigin, requestUrl);
   } catch (err) {
     // Tagged: inPageFetch formats its own failures identically, and telling the two apart
@@ -1486,8 +1547,49 @@ async function waitForStrayDownload(ids, timeoutMs = 120000) {
   return null;
 }
 
+/**
+ * Open `page`, then fetch `target` from inside it.
+ *
+ * For files served off a host that cannot be allowlisted because it changes per request.
+ * The tab is the trust boundary: it fetches only a url the page it is showing produced, and
+ * the worker never touches that host.
+ */
+/**
+ * Open `page`, then navigate it at `target` and let Chrome save the response.
+ *
+ * For a file whose host serves no CORS headers and cannot be allowlisted -- neither the page
+ * nor the worker may READ it, but the browser may still download it. Chrome destroys the tab
+ * when it converts the navigation into a download, and fetchPdf's stray watcher turns that
+ * into the result.
+ */
+async function navigateToFileInTab(page, target, budgetMs) {
+  devMark('annas:navigate-begin', { page: String(page).slice(0, 70), budgetMs });
+  const out = await fetchPdf({ url: page, referer: page, budgetMs, navigateTo: target });
+  devMark('annas:navigate-end', { ok: out.ok, saved: out.savedByBrowser === true,
+    error: out.ok ? undefined : String(out.error).slice(0, 70) });
+  if (out.ok && out.base64) return { ok: true, base64: out.base64, bytes: out.bytes };
+  if (out.ok && out.savedByBrowser) {
+    return { ok: true, savedByBrowser: true, filename: out.filename, bytes: out.bytes };
+  }
+  return { ok: false, error: out.error || 'annas produced no pdf' };
+}
+
+async function fetchLinkedFileInTab(page, target, budgetMs) {
+  return withClearedTab(page, async (tabId) => {
+    const [r] = await chrome.scripting.executeScript({
+      target: { tabId }, func: inPageFetchAsBase64, args: [target, MAX_PDF_BYTES],
+    });
+    const out = (r && r.result) || { ok: false, error: 'in-page fetch returned nothing' };
+    devHttp('annas:file', {
+      url: target, bytes: out.ok ? out.bytes : undefined,
+      magic: out.ok ? '%PDF-' : undefined, error: out.ok ? undefined : out.error,
+    });
+    return out;
+  }, budgetMs);
+}
+
 /** Fetches the PDF from inside a cleared tab on its own origin. */
-async function fetchPdf({ url, referer, budgetMs }) {
+async function fetchPdf({ url, referer, budgetMs, navigateTo }) {
   // urlTier, not isAllowedUrl: the latter answers only for the CREDENTIALED grant, so an
   // anonymous-tier host (a mirror, an OA repository) was refused as unlisted despite being
   // granted. The credentials themselves are still derived per-url inside the fetch, so
@@ -2195,7 +2297,16 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
   return true;
 });
 
-async function retrievePaper({ doi, pdfUrl, email, coreApiKey }) {
+async function retrievePaper({ doi, pdfUrl, email, coreApiKey, only, skip }) {
+  // Which sources may run. `only` is a whitelist, `skip` a blacklist; both name sources the
+  // way the ladder does ('unpaywall', 'scihub', 'annas', 'libgen', publisher names...).
+  // Exists so a run can be aimed at ONE source instead of hunting for a DOI that happens to
+  // reach it -- testing annas meant finding a paper sci-hub lacked, which is absurd.
+  const wanted = (name) => {
+    if (Array.isArray(only) && only.length) return only.includes(name);
+    if (Array.isArray(skip) && skip.length) return !skip.includes(name);
+    return true;
+  };
   const attempts = [];
 
   // The publisher's own bytes, unaltered. Corpus Studio runs its own qpdf over whatever it
@@ -2231,7 +2342,13 @@ async function retrievePaper({ doi, pdfUrl, email, coreApiKey }) {
     }
   }
   devStart('phase:openaccess');
-  for (const c of cheap) devMark('oa:candidate', { source: c.source, url: c.url });
+  const cheapWanted = cheap.filter((c) => wanted(c.source));
+  for (const c of cheap) {
+    if (!wanted(c.source)) devDecide(c.source, 'skip', 'excluded by the caller', null);
+    else devMark('oa:candidate', { source: c.source, url: c.url });
+  }
+  cheap.length = 0;
+  cheap.push(...cheapWanted);
   const raced = await Promise.all(cheap.map(async (c) => {
     const r = await fetchValidatedPdf(c.url);
     devHttp(`oa:${c.source}`, {
@@ -2428,9 +2545,26 @@ async function retrievePaper({ doi, pdfUrl, email, coreApiKey }) {
         if (remaining < MIRROR_HOST_MIN_MS) {
           return { ok: false, error: 'mirror phase budget exhausted' };
         }
-        const links = await fetchLinks({ url: page, budgetMs: remaining });
+        // crossOrigin: the file lives on a random per-request CDN host, never on the page's
+        // own origin, so a same-origin harvest finds nothing by construction.
+        const links = await fetchLinks({ url: page, budgetMs: remaining, crossOrigin: true });
         const pick = links.ok ? pickAnnasPdf(links.links, page) : null;
-        return pick ? fetchValidatedPdf(pick, { timeoutMs: 45000 }) : { ok: false, error: 'no file link' };
+        devDecide('annas', pick ? 'have-link' : 'no-link',
+          links.ok ? 'harvested the page' : String(links.error).slice(0, 70),
+          { links: links.ok ? links.links.length : 0, pick: pick ? String(pick).slice(0, 80) : null });
+        if (!pick) return { ok: false, error: 'no file link' };
+        // NAVIGATED to, not fetched.
+        //
+        // An in-page fetch was tried first and dies with "TypeError: Failed to fetch": the
+        // CDN serves no CORS headers, so Anna's own page may not read it either. A worker
+        // fetch is not an option either -- the host is random per request, so there is
+        // nothing to allowlist.
+        //
+        // Navigation is bound by none of that. The CDN answers with a Content-Disposition,
+        // so Chrome takes the response over and writes the file itself, which is exactly the
+        // path libgen already succeeds on. The tab dies in the process and the stray-download
+        // watcher reports what landed.
+        return navigateToFileInTab(page, pick, remaining);
       }],
       ['libgen', async () => {
         const u = await libgenPdfUrl(doi);
@@ -2473,8 +2607,15 @@ async function retrievePaper({ doi, pdfUrl, email, coreApiKey }) {
     ];
     // A confirmed hit goes to the front of its own phase; everything else keeps its measured
     // order behind it.
-    const promoted = ladder.filter(([name]) => hints.has[name])
-      .concat(ladder.filter(([name]) => !hints.has[name]));
+    // LibGen is pinned LAST whatever the hints say. It is reliable but slow -- measured at
+    // 23 KB/s, so a 2.9 MB paper takes 87 seconds where an open-access host takes two. A
+    // "libgen has it" hint is true and still not a reason to go there before the others have
+    // declined; promoting it would trade a two-second download for a ninety-second one.
+    const slowest = ladder.filter(([name]) => name === 'libgen');
+    const rest = ladder.filter(([name]) => name !== 'libgen');
+    const promoted = rest.filter(([name]) => hints.has[name])
+      .concat(rest.filter(([name]) => !hints.has[name]))
+      .concat(slowest);
     for (const [name, run] of promoted) {
       // Headroom, not a bare comparison. With 1ms left a bare `> mirrorDeadline` still lets
       // a source START, and annas/libgen then run their own independent 45s budgets and open
@@ -2482,6 +2623,10 @@ async function retrievePaper({ doi, pdfUrl, email, coreApiKey }) {
       // tabs keep appearing. A source that cannot finish is not worth beginning.
       if (Date.now() + MIRROR_HOST_MIN_MS > mirrorDeadline) {
         attempts.push({ source: name, error: 'skipped: mirror phase budget exhausted' });
+        continue;
+      }
+      if (!wanted(name)) {
+        devDecide(name, 'skip', 'excluded by the caller', null);
         continue;
       }
       if (parked[name]) {
@@ -2532,7 +2677,9 @@ async function retrievePaper({ doi, pdfUrl, email, coreApiKey }) {
   // PHASE 3 -- the publisher that owns this DOI, if any. May open a tab, may wait on a human.
   if (doi) {
     const entry = await findPublisher(doi, pdfUrl || null).catch(() => null);
-    if (entry) {
+    if (entry && !wanted(entry.name)) {
+      devDecide(entry.name, 'skip', 'excluded by the caller', null);
+    } else if (entry) {
       try {
         const id = entry.resolveId
           ? await entry.resolveId(doi, pdfUrl || null, {})
@@ -2597,7 +2744,7 @@ async function fetchValidatedPdf(url, { timeoutMs = 25000 } = {}) {
   }
 }
 
-async function fetchLinks({ url, budgetMs }) {
+async function fetchLinks({ url, budgetMs, crossOrigin = false }) {
   // urlTier, not isAllowedUrl: the latter answers only for the CREDENTIALED grant, so an
   // anonymous-tier host (a mirror, an OA repository) was refused as unlisted despite being
   // granted. The credentials themselves are still derived per-url inside the fetch, so
@@ -2619,6 +2766,9 @@ async function fetchLinks({ url, budgetMs }) {
     // legitimately finds nothing. Bounded by the same challenge budget the clear
     // used, so the total stays under the callers' timeouts.
     let settledEmpty = 0;
+    let crossDropped = 0;
+    let harvestLogged = false;
+    let tierDropped = 0;
     for (;;) {
       let raw = [];
       try {
@@ -2627,7 +2777,19 @@ async function fetchLinks({ url, budgetMs }) {
           func: inPagePdfLinks,
           args: [MAX_RAW_LINKS, MAX_LINK_CHARS],
         });
-        if (r && Array.isArray(r.result)) raw = r.result;
+        // The collector now reports what it turned down as well as what it kept, so a
+        // "no file link" can be diagnosed from the trace instead of by re-fetching the page.
+        if (r && r.result && Array.isArray(r.result.links)) {
+          raw = r.result.links;
+          if (!harvestLogged && r.result.rejected && r.result.rejected.length) {
+            harvestLogged = true;
+            devMark('harvest', {
+              anchors: r.result.anchors, kept: raw.length, rejected: r.result.rejected,
+            });
+          }
+        } else if (r && Array.isArray(r.result)) {
+          raw = r.result;
+        }
       } catch {
         // Tab navigating (the hydration can replace the document); retry.
       }
@@ -2641,7 +2803,20 @@ async function fetchLinks({ url, budgetMs }) {
         } catch {
           continue;
         }
-        if (u.origin !== origin) continue;
+        // Same-origin by default, because a page can link anywhere and following that
+        // blindly is how an extension becomes a fetch proxy for whatever a host decides to
+        // put on a page.
+        //
+        // Anna's is the documented exception. Its scidb page serves the file from a RANDOM
+        // per-request CDN host (measured: b4mcx2ml.net), so the only real link on the page is
+        // cross-origin AND unallowlistable -- there is no fixed host to grant. Dropping it
+        // meant the tab opened, rendered the link, discarded it, and reported "no file link"
+        // every single time. The caller opts in explicitly, and the tab is what fetches it:
+        // the bytes never touch the worker, so no grant is widened.
+        if (!crossOrigin && u.origin !== origin) {
+          crossDropped += 1;
+          continue;
+        }
         // urlTier, not isAllowedUrl -- the same correction already made to the gate at the
         // top of this function, and missed three lines later.
         //
@@ -2653,7 +2828,15 @@ async function fetchLinks({ url, budgetMs }) {
         //
         // Tier is the gate; credentials are still derived per-url at fetch time, so widening
         // what may be COLLECTED does not widen what is SENT.
-        if (urlTier(href) === TIER.NONE) continue;
+        // The tier gate applies to links the WORKER will fetch. It cannot apply to a
+        // crossOrigin harvest: the whole reason that mode exists is a file served from a
+        // host that changes per request, so there is nothing to allowlist. Those links are
+        // fetched from inside the tab instead -- see fetchLinkedFileInTab -- so the worker
+        // never touches the host and the gate is not the thing protecting anyone here.
+        if (!crossOrigin && urlTier(href) === TIER.NONE) {
+          tierDropped += 1;
+          continue;
+        }
         if (links.includes(href)) continue;
         links.push(href);
       }
@@ -2674,7 +2857,9 @@ async function fetchLinks({ url, budgetMs }) {
         if (st && st.ready && st.anchors > 0 && st.pending === 0) {
           settledEmpty += 1;
           if (settledEmpty >= 2) {
-            devMark('hydration:settled-empty', { anchors: st.anchors, url });
+            devMark('hydration:settled-empty', {
+              anchors: st.anchors, url, crossOriginDropped: crossDropped, tierDropped,
+            });
             return {
               ok: false,
               error: `the page settled with no pdf link (${st.anchors} anchors, `
