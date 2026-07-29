@@ -255,6 +255,24 @@ export function isScihubUnavailableHtml(html) {
  * that a publisher is known to hold the paper, while a mirror serving a captcha has told us
  * nothing at all -- so spending the user's attention on it buys nothing.
  */
+/**
+ * Is this DDoS-Guard's interstitial?
+ *
+ * Kept apart from isMirrorChallengeHtml on purpose. A challenge there means "skip this
+ * host"; this means the opposite -- open a tab, because the interstitial clears itself by
+ * running JS the worker cannot, and what the worker fetched is not what a browser sees.
+ *
+ * Narrow by design. `ddos-guard` as a substring of the whole body would also match a header
+ * or a script path on a page that rendered fine, and a marker that fires on GOOD pages
+ * silently loses papers the mirror has -- the way keying on altcha.min.js did.
+ */
+export function isDdosGuardHtml(html) {
+  if (typeof html !== 'string' || !html) return false;
+  const head = html.slice(0, 4096);
+  return /<title>\s*ddos-guard/i.test(head)
+    || /id=["']?ddg-captcha|class=["'][^"']*ddg-captcha/i.test(head);
+}
+
 export function isMirrorChallengeHtml(html) {
   if (typeof html !== 'string' || !html) return false;
   // Only the head of the document: a challenge page is small and says what it is at once,
