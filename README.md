@@ -147,7 +147,7 @@ The extension itself ships **no dependencies** — it is plain MV3 JavaScript. `
 `xml2js` are devDependencies of the Node-side resolvers and their tests only.
 
 ```bash
-npm test        # 94 tests
+npm test        # 97 tests
 npm run check   # syntax-check the worker and the popup
 ```
 
@@ -203,7 +203,7 @@ The extension also answers over Chrome's native messaging, so a local app can re
 instead of the user typing into the panel.
 
 ```
-desktop app --unix socket--> src/bridge/paper-bridge-host.js --stdio--> extension
+desktop app --unix socket--> src/bridge/corpus-retriever-host.js --stdio--> extension
 ```
 
 [Corpus Studio](https://github.com/Zothie/corpus-studio) uses this. Nothing about the

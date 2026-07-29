@@ -130,8 +130,9 @@ and refuses to zip** if one reference survives. Never submit a `--with-mirrors` 
 
 ## This repo is the source of truth — but it is not the only copy
 
-Corpus Studio ships a VENDORED copy at `resources/paper-bridge/extension/`. After any change
-here, run `npm run paper-bridge:sync` in that repo, or the app installs an old extension.
+Corpus Studio ships a VENDORED copy at `resources/corpus-retriever/extension/`. After any
+change here, run `npm run corpus-retriever:sync` in that repo, or the app installs an old
+extension.
 
 That staleness fails SILENTLY — the vendored tree is read only at install time, so nothing
 errors. It has already gone stale once: vendored 1.0.1 with no popup at all, while this repo
@@ -140,7 +141,7 @@ was on 1.0.2.
 ## Testing
 
 ```bash
-npm test                                   # full suite (92)
+npm test                                   # full suite (97)
 node --test tests/quick-download.test.mjs  # download path
 node --test tests/tab-cleanup.test.mjs     # tab safety — never dismiss a failure here
 npm run check                              # syntax-check worker + popup
@@ -167,7 +168,7 @@ extension/           WHAT CHROME LOADS — load this dir unpacked
 
 src/publishers/      the resolvers in Node form, and the SOURCE of publishers-bundle.js
 src/bridge/
-  paper-bridge-host.js  native-messaging host: unix socket <-> extension stdio
+  corpus-retriever-host.js  native-messaging host: unix socket <-> extension stdio
   allowed-hosts.js      the host's own allowlist copy; re-validates every URL
 src/utils/           logger + the per-source rate limiter for the public academic APIs
 
