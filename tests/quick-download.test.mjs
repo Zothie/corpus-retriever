@@ -33,6 +33,7 @@ function load(downloads = {}, fetchImpl = null, tabsWork = false) {
   const listeners = new Set();
   const createdListeners = new Set();
   const tabsOpened = [];
+  let pageLinks = null;
   const removedFiles = [];
   const erased = [];
   const chrome = {
@@ -92,7 +93,20 @@ function load(downloads = {}, fetchImpl = null, tabsWork = false) {
       id: 't',
     },
     storage: { session: { get: async () => ({}), set: async () => {} } },
-    scripting: { async executeScript() { return [{ result: null }]; } },
+    scripting: {
+      // Returns whatever a test put in `pageLinks`. Defaulting to null meant the link
+      // HARVEST FILTER in fetchLinks was never executed by any test -- which is how a filter
+      // that dropped every mirror link survived. See the fetchLinks test below.
+      async executeScript({ func }) {
+        // The worker runs several different in-page probes through this one API. Returning
+        // one canned value for all of them made the tab never clear; the harvest is only
+        // reached once pageIsCleared says the page is ready.
+        const name = typeof func === 'function' ? func.name : '';
+        if (name === 'inPagePdfLinks') return [{ result: pageLinks }];
+        if (name === 'pageIsCleared') return [{ result: 'cleared' }];
+        return [{ result: null }];
+      },
+    },
   };
   // The ONLY route to the wasm slimmer is chrome.runtime.getURL('vendor/qpdf.*'), so
   // counting those calls is a direct observation of whether a code path reached qpdf --
@@ -148,7 +162,7 @@ function load(downloads = {}, fetchImpl = null, tabsWork = false) {
   }
   const f = new Function(
     'chrome', 'console', 'URL', 'fetch', 'self', 'Date',
-    `${src}\nreturn { pdfFilename, downloadToBrowser, retrievePaper, parseDownloadInput, fetchPdf,`
+    `${src}\nreturn { pdfFilename, downloadToBrowser, retrievePaper, parseDownloadInput, fetchPdf, fetchLinks,`
     + `\n  slimPdf, bytesToBase64, base64ToBytes,`
     + `\n  setProbe: (fn) => { probeAvailability = fn; },`
     + `\n  mirrorPhaseDeadline: () => currentMirrorCeiling(),\n  setMirrorPhaseDeadline, clearMirrorPhaseDeadline };`,
@@ -175,6 +189,7 @@ function load(downloads = {}, fetchImpl = null, tabsWork = false) {
     skew,
     created,
     tabsOpened,
+    setPageLinks: (v) => { pageLinks = v; },
     qpdfRuns,
     qpdfUrlAsks,
     removedFiles,
@@ -644,4 +659,34 @@ test('the bridge path is NOT slimmed', async () => {
     api.qpdfUrlAsks.filter((u) => u.endsWith('.wasm')), [],
     'the bridge path instantiated the qpdf wasm',
   );
+});
+
+test('a mirror\'s own links survive the harvest filter', async () => {
+  // The filter used isAllowedUrl, which answers only for the CREDENTIALED grant -- and every
+  // mirror is ANONYMOUS tier. So it dropped EVERY link on a sci-hub, Anna's or libgen page:
+  // the tab opened, hydrated, had its whole harvest filtered away, and spun to the 45s
+  // hydration timeout before reporting nothing. A window held open for most of a minute on a
+  // page that demonstrably had the PDF, and the paper lost afterwards.
+  //
+  // No test could see it: executeScript was stubbed to return null, so the filter never ran.
+  const api = load({}, async () => { throw new Error('offline'); }, true);
+  api.setPageLinks([
+    'https://sci-hub.ru/storage/twin/6718/kucsko2013.pdf',
+    'https://sci-hub.ru/about',
+  ]);
+  const out = await api.fetchLinks({ url: 'https://sci-hub.ru/10.1/x', budgetMs: 5000 });
+  assert.equal(out.ok, true, out.error);
+  assert.ok(
+    out.links.includes('https://sci-hub.ru/storage/twin/6718/kucsko2013.pdf'),
+    `the mirror's own pdf link was filtered out: ${JSON.stringify(out.links)}`,
+  );
+});
+
+test('a link on a host we do not carry is still refused', async () => {
+  // The widening above must not become "collect anything". Tier is the gate; an ungranted
+  // host stays out, and credentials are still derived per-url at fetch time.
+  const api = load({}, async () => { throw new Error('offline'); }, true);
+  api.setPageLinks(['https://sci-hub.ru/storage/a.pdf', 'https://evil.example/x.pdf']);
+  const out = await api.fetchLinks({ url: 'https://sci-hub.ru/10.1/x', budgetMs: 5000 });
+  assert.deepEqual(out.links, ['https://sci-hub.ru/storage/a.pdf']);
 });

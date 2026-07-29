@@ -2120,7 +2120,18 @@ async function fetchLinks({ url, budgetMs }) {
           continue;
         }
         if (u.origin !== origin) continue;
-        if (!isAllowedUrl(href)) continue;
+        // urlTier, not isAllowedUrl -- the same correction already made to the gate at the
+        // top of this function, and missed three lines later.
+        //
+        // isAllowedUrl answers only for the CREDENTIALED grant, and every mirror is
+        // ANONYMOUS tier. So this dropped EVERY link on a sci-hub, Anna's or libgen page:
+        // the tab opened, hydrated, had its entire harvest filtered away, then spun to the
+        // 45s hydration timeout before reporting no links. A visible window for most of a
+        // minute, on a page that demonstrably held the PDF, and the paper lost afterwards.
+        //
+        // Tier is the gate; credentials are still derived per-url at fetch time, so widening
+        // what may be COLLECTED does not widen what is SENT.
+        if (urlTier(href) === TIER.NONE) continue;
         if (links.includes(href)) continue;
         links.push(href);
       }
