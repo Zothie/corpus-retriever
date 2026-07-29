@@ -32,22 +32,47 @@ export async function probeAvailability(doi, { email, coreApiKey } = {}) {
   if (!doi) return hints;
 
   const names = probeableMirrors();
-  const settled = await Promise.allSettled([
-    resolveOaCandidates(doi, { email, coreApiKey }),
-    ...names.map((name) => probeMirror(name, doi)),
-  ]);
+  // Return on the FIRST usable hint, and let the stragglers finish in the background.
+  //
+  // Waiting for all of them is waiting for the slowest, and the whole point of the hint is
+  // to start the download sooner. Measured live: sci-hub answered "present" at 1452ms while
+  // the group did not settle until 2258ms, so 806ms of the probe's cost bought an answer
+  // nobody was going to act on -- the ladder was always going to try that first source next.
+  //
+  // The stragglers are NOT cancelled. They are cheap GET requests already in flight, they
+  // populate the same `hints` object if they land in time to matter, and aborting them would
+  // buy nothing while adding a cancellation path to get wrong. What changes is only that
+  // nobody WAITS for them.
+  const settle = [];
+  let resolveFirst;
+  const firstUsable = new Promise((r) => { resolveFirst = r; });
 
-  const [oa, ...mirrors] = settled;
-  if (oa.status === 'fulfilled' && Array.isArray(oa.value)) {
-    for (const c of oa.value) {
-      if (c && c.source && c.pdfUrl) hints.has[c.source] = c.pdfUrl;
+  const noteOa = (list) => {
+    if (!Array.isArray(list)) return;
+    for (const c of list) {
+      if (c && c.source && c.pdfUrl) {
+        hints.has[c.source] = c.pdfUrl;
+        resolveFirst();
+      }
     }
-  }
-  mirrors.forEach((r, i) => {
-    // A rejected probe is `unknown` by omission -- see the asymmetry note above.
-    if (r.status !== 'fulfilled') return;
-    if (r.value === 'present') hints.has[names[i]] = true;
-    else if (r.value === 'absent') hints.ruledOut.push(names[i]);
-  });
+  };
+  const noteMirror = (name, verdict) => {
+    if (verdict === 'present') {
+      hints.has[name] = true;
+      resolveFirst();
+    } else if (verdict === 'absent') {
+      hints.ruledOut.push(name);
+    }
+  };
+
+  settle.push(
+    resolveOaCandidates(doi, { email, coreApiKey }).then(noteOa, () => {}),
+    ...names.map((name) => probeMirror(name, doi).then((v) => noteMirror(name, v), () => {})),
+  );
+
+  // Whichever comes first: a source that says it HAS the paper, or every source finishing.
+  // The second arm is what makes a total miss still return -- and return with the negatives
+  // the ladder needs in order to skip anything.
+  await Promise.race([firstUsable, Promise.allSettled(settle)]);
   return hints;
 }
