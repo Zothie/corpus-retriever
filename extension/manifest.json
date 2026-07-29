@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Corpus Retriever",
-  "version": "1.0.2",
+  "version": "1.0.3",
   "description": "Paste a DOI and save the paper to your Downloads folder.",
   "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAwp9016wkauHLL348YME/8Cjr699qP0Us0AwKO8zRjcMvD+TS4eMUweBHwbUQ9SMdLB/rD16DgOvXpoY8jqFbbCKR8XPDY99fvpORtHnMRmwwIqkCUI19SjDnaO8/kv13lIn3sjzyFnXwL9XoEsYY2IH4mWQlTcFAYPu5u0UtvZeLIw0/RntYqEYksoXJOXWvOPKFICYGT3kZfK6atRskpWBbo3vDSwonqnnC1f5kP5LlD97t+dOSlt10f2MrBoDN9V+TJwuwGCglWc0JEmPeGx17RmwCWUdGiyF3Vm2IgeQLhZmXeeP8MQJpOjMnf1W6bZn6wIhgVejrMtp2r4tf8QIDAQAB",
   "background": {
