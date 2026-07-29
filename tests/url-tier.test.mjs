@@ -124,14 +124,38 @@ test('no fetch in the extension may pass a hardcoded credentials value', () => {
   //
   // Strip comments first: the rationale for the anonymous retry legitimately mentions
   // credentials:'include' in prose, and matching that would make this unfixable-by-design.
-  const hardcoded = ['extension/background.js', 'extension/search-sources.js']
-    .flatMap((f) => readFileSync(join(repoRoot, f), 'utf8')
+  //
+  // ONE exemption, and only one: a function INJECTED INTO A PAGE cannot call credentialsFor,
+  // because that lives in the worker and is not in scope there. inPageFetchAsBase64 is that
+  // function, and it must pass 'omit' -- the host it reads answers
+  // `Access-Control-Allow-Origin: *`, and CORS forbids pairing a wildcard origin with
+  // credentials, so 'include' fails before any code sees the response. The exemption is
+  // narrow by construction: 'omit' can only ever REDUCE what is sent, so the hole this test
+  // exists to prevent -- a call site quietly requesting cookies -- stays closed.
+  const source = ['extension/background.js', 'extension/search-sources.js']
+    .map((f) => readFileSync(join(repoRoot, f), 'utf8')
       .replace(/\/\*[\s\S]*?\*\//g, '')
-      .replace(/(^|[^:])\/\/.*$/gm, '$1')
-      .match(/credentials:\s*'(include|omit)'/g) || []);
+      .replace(/(^|[^:])\/\/.*$/gm, '$1'))
+    .join('\n');
+
+  // 'include' is forbidden outright, anywhere, no exemption.
   assert.deepEqual(
-    hardcoded, [],
-    'credentials must come from credentialsFor(url), never a literal at the call site',
+    source.match(/credentials:\s*'include'/g) || [], [],
+    "credentials: 'include' must come from credentialsFor(url), never a literal",
+  );
+
+  // 'omit' is allowed only inside the in-page fetch helper. Checked by counting: if a second
+  // one appears anywhere else, this fails and the author has to justify it here.
+  const omits = source.match(/credentials:\s*'omit'/g) || [];
+  assert.equal(
+    omits.length, 1,
+    `expected exactly one 'omit' (inPageFetchAsBase64), found ${omits.length}`,
+  );
+  const helper = source.slice(source.indexOf('function inPageFetchAsBase64'));
+  const helperEnd = helper.indexOf('\n}\n');
+  assert.match(
+    helper.slice(0, helperEnd), /credentials:\s*'omit'/,
+    "the one permitted 'omit' must be the one inside inPageFetchAsBase64",
   );
 });
 

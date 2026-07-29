@@ -114,6 +114,15 @@ export const ALLOWED_HOSTS = [
   'onlinelibrary.wiley.com',
   'pubs.acs.org',
   'academic.oup.com',
+  // Silverchair's watermark host, where OUP and ACS actually SERVE the file. The article
+  // page is on academic.oup.com and the download is a signed handoff to
+  // watermark02.silverchair.com/<id>.pdf?token=..., so granting only the landing host meant
+  // the tab followed the handoff, failed the origin re-pin, and then waited out its whole
+  // budget on a page that could never satisfy it. Measured 2026-07-30 on 10.1093/nar/gkaa1100.
+  //
+  // Credentialed like the publishers it serves: the token authorises the file, but the
+  // session is what authorises the token.
+  'silverchair.com',
   // elsevier.com is deliberately absent: linkinghub.elsevier.com is only ever a
   // redirect hop while resolving a DOI to a PII, and our own plain HTTP client
   // does that server-side. It never goes through the bridge, so it needs no

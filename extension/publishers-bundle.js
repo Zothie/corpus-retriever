@@ -1379,13 +1379,21 @@ function acsLandingUrl(id) {
 /**
  * Picks the full text out of an ACS article page.
  *
- * Silverchair's download path is /<journal-code>/article-pdf/doi/..., and the page also
- * links supplementary material as .pdf. Without this the first candidate wins and a
- * supplement gets filed as the paper -- worse than a failed download, because nothing
- * downstream can detect it. Verified live: the jacs.6c07767 page yields exactly
- * https://pubs.acs.org/jacsat/article-pdf/doi/10.1021/jacs.6c07767/66240843/jacs.6c07767.pdf
+ * Silverchair serves the article PDF from /<journal-code>/article-pdf/, and the page also
+ * links supplementary material as .pdf. Matching on `article-pdf` rather than on `.pdf` is
+ * what keeps a supplement from being filed as the paper -- worse than a failed download,
+ * because nothing downstream can detect it.
+ *
+ * TWO shapes, both measured live:
+ *   .../jacsat/article-pdf/doi/10.1021/jacs.6c07767/66240843/jacs.6c07767.pdf
+ *   .../accacs/article-pdf/16/13/12814/65101330/cs-2026-025563.pdf
+ *
+ * The second is the volume/issue form, and requiring `doi/` rejected it -- so a free ACS
+ * paper whose page offered exactly one real PDF link came back as "no link matched this
+ * publisher". Supplements live under /doi/suppl/ and carry no `article-pdf` segment, so
+ * dropping the `doi/` requirement widens this to the article PDF and nothing else.
  */
-const ACS_PDF_LINK = /\/article-pdf\/doi\//;
+const ACS_PDF_LINK = /\/article-pdf\//;
 
 // --- src/publishers/oup-retrieval.js ---
 // Oxford University Press (academic.oup.com).
@@ -1865,9 +1873,16 @@ const PUBLISHERS = [
     // An OUP article page links its supplementary material as .pdf too, and those satisfy
     // the shape rules and the %PDF- check just as well as the full text does. Without this
     // the first link wins and a supplement gets filed as the paper, which is worse than a
-    // failed download because nothing downstream can detect it. Both observed full-text
-    // path shapes ("/article-pdf/" and "/advance-article-pdf/") end in the same token.
-    preferPdfLink: /\/(advance-)?article-pdf\//,
+    // failed download because nothing downstream can detect it.
+    //
+    // THREE shapes, all observed. The first two are paths on academic.oup.com itself; the
+    // third is the signed handoff to Silverchair's watermark host, measured 2026-07-30:
+    //   .../article-pdf/49/D1/D1/...
+    //   .../advance-article-pdf/doi/...
+    //   https://watermark02.silverchair.com/gkaa1100.pdf?token=AQECAHi208BE49O...
+    // The handoff is what a browser actually follows, and matching only the first two left
+    // the page's real link on the floor while the tab sat open to its budget.
+    preferPdfLink: /\/(advance-)?article-pdf\/|watermark\d*\.silverchair\.com\/.+\.pdf/,
     manualLabel: 'OUP article page',
     headed: false,
     // Each sample carries the article URL as well as the DOI because extractId is

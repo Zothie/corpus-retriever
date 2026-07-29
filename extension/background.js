@@ -166,6 +166,15 @@ const ALLOWED_HOSTS = [
   'onlinelibrary.wiley.com',
   'pubs.acs.org',
   'academic.oup.com',
+  // Silverchair's watermark host, where OUP and ACS actually SERVE the file. The article
+  // page is on academic.oup.com and the download is a signed handoff to
+  // watermark02.silverchair.com/<id>.pdf?token=..., so granting only the landing host meant
+  // the tab followed the handoff, failed the origin re-pin, and then waited out its whole
+  // budget on a page that could never satisfy it. Measured 2026-07-30 on 10.1093/nar/gkaa1100.
+  //
+  // Credentialed like the publishers it serves: the token authorises the file, but the
+  // session is what authorises the token.
+  'silverchair.com',
   // elsevier.com is deliberately absent: linkinghub.elsevier.com is only ever a
   // redirect hop while resolving a DOI to a PII, and our own plain HTTP client
   // does that server-side. It never goes through the bridge, so it needs no
@@ -2840,15 +2849,39 @@ async function retrievePaper({ doi, pdfUrl, email, coreApiKey, only, skip }) {
             // No constructible pdf url (Mendeley, OUP, ACS): read the link out of the
             // rendered page, then fetch it down the ordinary path.
             : await (async () => {
-              const links = await fetchLinks({ url: landing, budgetMs: PUBLISHER_BUDGET_MS });
+              // crossOrigin: several publishers serve the file from a DIFFERENT host than
+              // the article page. Measured on OUP: the landing page is academic.oup.com and
+              // the real link is watermark02.silverchair.com/gkaa1100.pdf?token=... -- a
+              // signed, expiring url. The same-origin rule dropped it, so the page's only
+              // real link was discarded and the tab then sat open until its budget ran out,
+              // which read as a hang. ScienceDirect and ACS hand off the same way.
+              //
+              // Safe because the harvest still has to match the publisher's own
+              // preferPdfLink pattern, and the bytes are fetched through the tab that
+              // rendered the link rather than by the worker.
+              const links = await fetchLinks({
+                url: landing, budgetMs: PUBLISHER_BUDGET_MS, crossOrigin: true,
+              });
               if (!links.ok || !links.links.length) {
                 return { ok: false, error: links.error || 'no pdf links on the page' };
               }
               const pick = entry.preferPdfLink
                 ? links.links.find((l) => entry.preferPdfLink.test(l))
                 : links.links[0];
+              // Which link was chosen, and when none was, WHAT was on offer. "no link matched
+              // this publisher" alone cannot be told from "the page had nothing", and the
+              // difference is a one-line pattern fix versus a paywall.
+              devDecide(entry.name, pick ? 'have-link' : 'no-match',
+                pick ? 'a link matched the publisher pattern' : 'no link matched the pattern',
+                {
+                  pattern: entry.preferPdfLink ? String(entry.preferPdfLink) : '(first link)',
+                  offered: links.links.slice(0, 4).map((l) => l.slice(0, 90)),
+                });
               return pick
-                ? fetchPdf({ url: pick, referer: landing })
+                // budgetMs, or this silently inherits the ONE HOUR human-solve default and a
+                // handoff that never clears holds a tab for the rest of the day. Measured on
+                // OUP: the tab opened with budgetMs 3600000 and simply sat there.
+                ? fetchPdf({ url: pick, referer: landing, budgetMs: PUBLISHER_BUDGET_MS })
                 : { ok: false, error: 'no link matched this publisher' };
             })();
           if (out.ok && out.base64) {
@@ -6318,13 +6351,21 @@ function acsLandingUrl(id) {
 /**
  * Picks the full text out of an ACS article page.
  *
- * Silverchair's download path is /<journal-code>/article-pdf/doi/..., and the page also
- * links supplementary material as .pdf. Without this the first candidate wins and a
- * supplement gets filed as the paper -- worse than a failed download, because nothing
- * downstream can detect it. Verified live: the jacs.6c07767 page yields exactly
- * https://pubs.acs.org/jacsat/article-pdf/doi/10.1021/jacs.6c07767/66240843/jacs.6c07767.pdf
+ * Silverchair serves the article PDF from /<journal-code>/article-pdf/, and the page also
+ * links supplementary material as .pdf. Matching on `article-pdf` rather than on `.pdf` is
+ * what keeps a supplement from being filed as the paper -- worse than a failed download,
+ * because nothing downstream can detect it.
+ *
+ * TWO shapes, both measured live:
+ *   .../jacsat/article-pdf/doi/10.1021/jacs.6c07767/66240843/jacs.6c07767.pdf
+ *   .../accacs/article-pdf/16/13/12814/65101330/cs-2026-025563.pdf
+ *
+ * The second is the volume/issue form, and requiring `doi/` rejected it -- so a free ACS
+ * paper whose page offered exactly one real PDF link came back as "no link matched this
+ * publisher". Supplements live under /doi/suppl/ and carry no `article-pdf` segment, so
+ * dropping the `doi/` requirement widens this to the article PDF and nothing else.
  */
-const ACS_PDF_LINK = /\/article-pdf\/doi\//;
+const ACS_PDF_LINK = /\/article-pdf\//;
 
 // --- src/publishers/oup-retrieval.js ---
 // Oxford University Press (academic.oup.com).
@@ -6804,9 +6845,16 @@ const PUBLISHERS = [
     // An OUP article page links its supplementary material as .pdf too, and those satisfy
     // the shape rules and the %PDF- check just as well as the full text does. Without this
     // the first link wins and a supplement gets filed as the paper, which is worse than a
-    // failed download because nothing downstream can detect it. Both observed full-text
-    // path shapes ("/article-pdf/" and "/advance-article-pdf/") end in the same token.
-    preferPdfLink: /\/(advance-)?article-pdf\//,
+    // failed download because nothing downstream can detect it.
+    //
+    // THREE shapes, all observed. The first two are paths on academic.oup.com itself; the
+    // third is the signed handoff to Silverchair's watermark host, measured 2026-07-30:
+    //   .../article-pdf/49/D1/D1/...
+    //   .../advance-article-pdf/doi/...
+    //   https://watermark02.silverchair.com/gkaa1100.pdf?token=AQECAHi208BE49O...
+    // The handoff is what a browser actually follows, and matching only the first two left
+    // the page's real link on the floor while the tab sat open to its budget.
+    preferPdfLink: /\/(advance-)?article-pdf\/|watermark\d*\.silverchair\.com\/.+\.pdf/,
     manualLabel: 'OUP article page',
     headed: false,
     // Each sample carries the article URL as well as the DOI because extractId is

@@ -557,10 +557,14 @@ test('a source the probe ruled out is skipped, and SAYS it was skipped', async (
 });
 
 test('a source the probe found is tried FIRST within its phase', async () => {
-  const api = loadProbing({ has: { libgen: true } });
+  // annas, not libgen: libgen is PINNED LAST regardless of hints, because it is reliable but
+  // slow -- measured at 23 KB/s, so a 2.9 MB paper takes 87 seconds there against two from an
+  // open-access host. Promoting it would trade a fast download for a slow one, so a "libgen
+  // has it" hint is true and still not a reason to go there first.
+  const api = loadProbing({ has: { annas: true } });
   const out = await api.retrievePaper({ doi: '10.1038/nature12373', email: 'a@b.c' });
 
-  assert.deepEqual(mirrorOrder(out), ['libgen', 'scihub', 'annas'], 'the hint did not promote');
+  assert.deepEqual(mirrorOrder(out), ['annas', 'scihub', 'libgen'], 'the hint did not promote');
 });
 
 test('when the hinted source fails, the COMPLETE ladder runs -- ruled-out sources included', async () => {
@@ -568,10 +572,12 @@ test('when the hinted source fails, the COMPLETE ladder runs -- ruled-out source
   // wrong: a 429 or a captcha page misread as a definitive negative. Trusting it AFTER the
   // promoted source has already failed would turn a wrong hint into a lost paper, when the
   // whole point of the asymmetry is that it costs only latency.
-  const api = loadProbing({ has: { libgen: true }, ruledOut: ['scihub'] });
+  const api = loadProbing({ has: { annas: true }, ruledOut: ['scihub'] });
   const out = await api.retrievePaper({ doi: '10.1038/nature12373', email: 'a@b.c' });
 
-  assert.deepEqual(mirrorOrder(out), ['libgen', 'scihub', 'annas'], 'a source was dropped');
+  // libgen stays last even here: it is pinned regardless of hints, so a full ladder means
+  // every source ran, not that the order was abandoned.
+  assert.deepEqual(mirrorOrder(out), ['annas', 'scihub', 'libgen'], 'a source was dropped');
   const scihub = entryFor(out, 'scihub');
   assert.doesNotMatch(
     scihub.error,
