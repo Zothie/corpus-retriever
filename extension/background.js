@@ -5,7 +5,7 @@
 // UA and IP that earned it, and headless Chrome is detected regardless. Only an
 // in-browser fetch presents the right everything at once.
 
-const NATIVE_HOST = 'com.repository.paper_bridge';
+const NATIVE_HOST = 'com.repository.corpus_retriever';
 const MAX_PDF_BYTES = 80 * 1024 * 1024;
 
 // Bounds for fetch_links. That capability reads hrefs out of a page the user's
@@ -85,9 +85,13 @@ const SCHOLAR_TIMEOUT_MS = 30 * 1000;
 // put this phase past 170s. Mirrors are the last resort for a paper nothing else had, so
 // giving up on them is a worse outcome than waiting -- but not by minutes.
 const MIRROR_PHASE_BUDGET_MS = 90 * 1000;
-const RECONNECT_ALARM = 'paper-bridge-reconnect';
+// Room a single mirror host needs to be worth starting. Below this the tab would be opened
+// only to be abandoned mid-hydration, which costs the user a visible window and returns
+// nothing.
+const MIRROR_HOST_MIN_MS = 15 * 1000;
+const RECONNECT_ALARM = 'corpus-retriever-reconnect';
 // Fires while the bridge is HEALTHY, so an evicted worker is revived. See connect().
-const HEARTBEAT_ALARM = 'paper-bridge-heartbeat';
+const HEARTBEAT_ALARM = 'corpus-retriever-heartbeat';
 
 // Must stay in sync with src/bridge/allowed-hosts.js. The socket is the trust
 // boundary, so re-check here: a compromised local process must not be able to
@@ -1111,7 +1115,7 @@ async function withClearedTab(landing, body, budgetMs = HUMAN_SOLVE_BUDGET_MS) {
 }
 
 /** Fetches the PDF from inside a cleared tab on its own origin. */
-async function fetchPdf({ url, referer }) {
+async function fetchPdf({ url, referer, budgetMs }) {
   // urlTier, not isAllowedUrl: the latter answers only for the CREDENTIALED grant, so an
   // anonymous-tier host (a mirror, an OA repository) was refused as unlisted despite being
   // granted. The credentials themselves are still derived per-url inside the fetch, so
@@ -1124,7 +1128,24 @@ async function fetchPdf({ url, referer }) {
   // byte-returning grant deliberately does not cover.
   const landing = (typeof referer === 'string' && isAllowedNavigationUrl(referer)) ? referer : url;
 
-  return withClearedTab(landing, async (tabId, deadline, expectedOrigin, requestUrl) => {
+  // Downloads Chrome starts BY ITSELF while this call navigates.
+  //
+  // The navigate branches below point the tab AT the pdf to make it a document request. When
+  // the response carries a Content-Disposition (libgen's get.php, publisher watermark hosts)
+  // Chrome does not render it -- it SAVES it, and no code here asked for that. Left alone the
+  // user gets a file they did not request, under Chrome's own name, whether or not this call
+  // ends up succeeding: that is the "it downloaded a pdf but kept opening websites" report.
+  //
+  // Watched rather than guessed at: only ids that appear while this call is navigating are
+  // touched, so a download the user started themselves is never in scope.
+  const strays = new Set();
+  const noteStray = (item) => {
+    if (item && typeof item.id === 'number') strays.add(item.id);
+  };
+  chrome.downloads.onCreated.addListener(noteStray);
+
+  try {
+  return await withClearedTab(landing, async (tabId, deadline, expectedOrigin, requestUrl) => {
     // One attempt: try in the page, and fall back to the worker when the page refuses
     // a cross-origin hop. Both paths are needed on every attempt, not just the first --
     // the in-page fetch is what carries the cleared session, but a redirect off-origin
@@ -1319,7 +1340,23 @@ async function fetchPdf({ url, referer }) {
       result = { ...result, error: `${result.error} TRACE=${trace.join('|')}` };
     }
     return result;
-  });
+  }, budgetMs);
+  } finally {
+    chrome.downloads.onCreated.removeListener(noteStray);
+    // Erase, do not merely forget. The bytes this function returns are saved deliberately by
+    // downloadToBrowser under the paper's real title; a copy Chrome saved on its own is a
+    // duplicate at best and, when the retrieval failed, a file for a paper the user was told
+    // could not be found. Either way it is not theirs and it is not named like anything they
+    // asked for.
+    //
+    // removeFile before erase: erase alone drops the history row and ORPHANS the file on
+    // disk, which is the opposite of cleaning up. Both are best-effort -- a download the user
+    // cancelled, or one already gone, throws and is nothing to report.
+    for (const id of strays) {
+      await chrome.downloads.removeFile(id).catch(() => {});
+      await chrome.downloads.erase({ id }).catch(() => {});
+    }
+  }
 }
 
 /**
@@ -1748,12 +1785,55 @@ async function retrievePaper({ doi, pdfUrl, email, coreApiKey }) {
   // output is indistinguishable from one that has hung.
   const mirrorDeadline = Date.now() + MIRROR_PHASE_BUDGET_MS;
   const parked = await parkedSources();
-  if (doi) {
+  // The try opens BEFORE the doi gate so the ceiling is set and cleared by the same block.
+  // Setting it outside meant a pdfUrl-only retrieval (no doi) skipped the phase without ever
+  // running the finally, leaving the ceiling at a timestamp that is then in the past
+  // forever -- every later call would skip its mirrors outright and never say why.
+  try {
+    // Publish the ceiling so every mirror helper is bounded by the PHASE, not only by its
+    // own budget.
+    setMirrorPhaseDeadline(mirrorDeadline);
+    if (doi) {
     for (const [name, run] of [
       ['scihub', async () => {
+        // PROBE FIRST, open a tab second -- the pattern libgen and annas already use.
+        //
+        // This used to call fetchLinks (which opens a TAB) once per host, for every host in
+        // a list that is five long and comes off the network, so it can be longer. A DOI
+        // sci-hub does not carry therefore cost the user a visible window per mirror, one
+        // after another, and the group budget could not be consulted until all of them had
+        // been walked. That is the reported symptom: websites still opening after the PDF
+        // had already been saved.
+        //
+        // A plain fetch tells us whether the host is up and whether it has the article at
+        // all. Only a host that answers with something PDF-shaped earns a tab, because the
+        // tab exists solely to run the page's JS and resolve the real file url.
         for (const host of await scihubMirrors()) {
+          if (Date.now() + MIRROR_HOST_MIN_MS > mirrorDeadline) {
+            return { ok: false, error: 'mirror phase budget exhausted' };
+          }
           const page = scihubArticleUrl(host, doi);
-          const links = await fetchLinks({ url: page });
+          const body = await getTextMirror(page, PROBE_TIMEOUT_MS_MIRROR);
+          // Host down, or rate-limiting: try the next one, still without a tab.
+          if (body === null) continue;
+          // Skip ONLY on a definitive "not in my database" answer.
+          //
+          // The test is deliberately NOT "did the static html contain a pdf link". The whole
+          // reason a tab exists here is that the link may be written by the page's own JS or
+          // carried on a `src` rather than an `href`, so absence proves nothing and skipping
+          // on it would silently lose papers Sci-Hub actually has -- a worse bug than the
+          // stray tab this probe is here to prevent. Only the not-found page is conclusive,
+          // because for it no link will EVER render, whatever the JS does.
+          if (isScihubUnavailableHtml(body)) continue;
+          // The tab inherits what is LEFT of the phase, not fetchLinks' one-hour default.
+          // That default is there so a human can solve a publisher captcha; no human is
+          // waiting on a mirror, and inheriting it let one host hold a tab open long after
+          // the ninety-second phase was over -- the "it kept opening websites" report.
+          const remaining = mirrorDeadline - Date.now();
+          if (remaining < MIRROR_HOST_MIN_MS) {
+            return { ok: false, error: 'mirror phase budget exhausted' };
+          }
+          const links = await fetchLinks({ url: page, budgetMs: remaining });
           const pick = links.ok ? pickScihubPdf(links.links, page) : null;
           if (pick) {
             const r = await fetchValidatedPdf(pick, { timeoutMs: 45000 });
@@ -1765,7 +1845,13 @@ async function retrievePaper({ doi, pdfUrl, email, coreApiKey }) {
       ['annas', async () => {
         const page = await annasArticleUrl(doi);
         if (!page) return { ok: false, error: 'no reachable annas mirror' };
-        const links = await fetchLinks({ url: page });
+        // Same bound as sci-hub: annasArticleUrl has already spent part of the phase
+        // walking mirrors, so the tab gets what is left rather than the one-hour default.
+        const remaining = mirrorDeadline - Date.now();
+        if (remaining < MIRROR_HOST_MIN_MS) {
+          return { ok: false, error: 'mirror phase budget exhausted' };
+        }
+        const links = await fetchLinks({ url: page, budgetMs: remaining });
         const pick = links.ok ? pickAnnasPdf(links.links, page) : null;
         return pick ? fetchValidatedPdf(pick, { timeoutMs: 45000 }) : { ok: false, error: 'no file link' };
       }],
@@ -1777,13 +1863,34 @@ async function retrievePaper({ doi, pdfUrl, email, coreApiKey }) {
         // opaque "Failed to fetch" even though the host is granted -- while the same url
         // downloads fine from Node. The tab path is what every walled publisher already
         // uses and is not bound by CORS.
-        const out = await fetchPdf({ url: u, referer: `https://${new URL(u).host}/` });
+        //
+        // Bounded by what is LEFT of the mirror budget, not by fetchPdf's default hour.
+        // That default exists so a human can solve a publisher captcha; no human is
+        // involved here, and inheriting it let a single mirror hold a tab open for an hour
+        // inside a phase that is supposed to last ninety seconds.
+        // Checked AFTER the resolver, not just before it: libgenPdfUrl walks several hops of
+        // its own, so the budget that was sufficient when this source started can be gone by
+        // the time there is a url to fetch. A budget of ~0 still opens a tab, fails its first
+        // poll and closes it -- a window that flashes at the user for no reason.
+        const remaining = mirrorDeadline - Date.now();
+        if (remaining < MIRROR_HOST_MIN_MS) {
+          return { ok: false, error: 'mirror phase budget exhausted' };
+        }
+        const out = await fetchPdf({
+          url: u,
+          referer: `https://${new URL(u).host}/`,
+          budgetMs: remaining,
+        });
         return out.ok && out.base64
           ? { ok: true, base64: out.base64, bytes: out.bytes }
           : { ok: false, error: out.error || 'libgen produced no pdf' };
       }],
     ]) {
-      if (Date.now() > mirrorDeadline) {
+      // Headroom, not a bare comparison. With 1ms left a bare `> mirrorDeadline` still lets
+      // a source START, and annas/libgen then run their own independent 45s budgets and open
+      // tabs the whole way -- so the phase overran by minutes while the user watched mirror
+      // tabs keep appearing. A source that cannot finish is not worth beginning.
+      if (Date.now() + MIRROR_HOST_MIN_MS > mirrorDeadline) {
         attempts.push({ source: name, error: 'skipped: mirror phase budget exhausted' });
         continue;
       }
@@ -1806,6 +1913,12 @@ async function retrievePaper({ doi, pdfUrl, email, coreApiKey }) {
         await parkSource(name, `${err.name}: ${err.message}`);
       }
     }
+    }
+  } finally {
+    // On EVERY exit, including the returns that deliver a pdf. A ceiling left set would
+    // bound the next call's mirror phase to this call's deadline -- already in the past --
+    // so mirrors would be skipped wholesale for the rest of the worker's life.
+    setMirrorPhaseDeadline(0);
   }
   // ---8<--- end mirror phase ---8<---
 
@@ -1902,7 +2015,7 @@ async function fetchValidatedPdf(url, { timeoutMs = 25000 } = {}) {
   }
 }
 
-async function fetchLinks({ url }) {
+async function fetchLinks({ url, budgetMs }) {
   // urlTier, not isAllowedUrl: the latter answers only for the CREDENTIALED grant, so an
   // anonymous-tier host (a mirror, an OA repository) was refused as unlisted despite being
   // granted. The credentials themselves are still derived per-url inside the fetch, so
@@ -1993,7 +2106,7 @@ async function fetchLinks({ url }) {
       }
       await new Promise((resolve) => setTimeout(resolve, CHALLENGE_POLL_MS));
     }
-  });
+  }, budgetMs);
 }
 
 /** Emits the header message, then the base64 body as CHUNK_CHARS-sized frames. */
@@ -2263,6 +2376,21 @@ chrome.alarms.onAlarm.addListener((alarm) => {
 chrome.runtime.onStartup.addListener(connect);
 chrome.runtime.onInstalled.addListener(connect);
 connect();
+
+// Alarms this extension registered under its previous name.
+//
+// Alarms survive an extension update, and the names are the only handle on them. After the
+// rename the old pair keeps firing on a worker whose onAlarm no longer matches them, so they
+// wake it for nothing and never clear themselves. Clearing by name is idempotent and costs
+// one call on a name that is already gone.
+// Not `.catch()` on the result: clear() is callback-style as well as promise-returning
+// depending on how it is reached, so assuming a thenable here throws at TOP LEVEL and takes
+// the whole worker down with it -- registration included.
+try {
+  for (const stale of ['paper-bridge-reconnect', 'paper-bridge-heartbeat']) {
+    chrome.alarms.clear(stale);
+  }
+} catch { /* nothing to clear, or no alarms permission */ }
 
 // ---8<--- search sources (inlined) ---8<---
 // Inlined rather than imported: background.js is a CLASSIC service worker, so a dynamic
@@ -2925,9 +3053,39 @@ async function getTextMirror(url, timeoutMs = FETCH_TIMEOUT_MS_MIRROR) {
  */
 let lastMirrorError = null;
 
+/**
+ * The mirror PHASE's deadline, as an absolute timestamp, or 0 when no phase is running.
+ *
+ * Every mirror helper is bounded by its own budget AND by this. Without the second bound the
+ * per-source budgets simply add up: a source allowed to start with a little time left ran its
+ * own independent 45s walk, and libgen then did three further 20s hops on top, so a phase
+ * meant to last 90s could run for minutes -- opening a tab at each step, which is what the
+ * user saw as "it kept opening websites".
+ *
+ * Module-level rather than threaded through every signature because the helpers call each
+ * other several levels deep; a parameter would have to be passed through functions that have
+ * no other use for it, and any one omission silently restores the unbounded behaviour.
+ */
+let mirrorPhaseDeadline = 0;
+
+function setMirrorPhaseDeadline(at) {
+  mirrorPhaseDeadline = typeof at === 'number' && at > 0 ? at : 0;
+}
+
+/** The soonest of a local budget and the phase ceiling. */
+function boundedDeadline(localBudgetMs) {
+  const local = Date.now() + localBudgetMs;
+  return mirrorPhaseDeadline > 0 ? Math.min(local, mirrorPhaseDeadline) : local;
+}
+
+/** True when the phase ceiling has passed, for the hops that have no budget of their own. */
+function mirrorPhaseExhausted() {
+  return mirrorPhaseDeadline > 0 && Date.now() > mirrorPhaseDeadline;
+}
+
 async function firstReachable(hosts, pathFor) {
   let lastError = null;
-  const deadline = Date.now() + SOURCE_BUDGET_MS_MIRROR;
+  const deadline = boundedDeadline(SOURCE_BUDGET_MS_MIRROR);
   for (const host of hosts) {
     // Stop walking once the budget is gone: 14 hosts at 12s each is minutes, and the
     // remaining ones are no more likely to answer than the ones that just did not.
@@ -2982,6 +3140,33 @@ function scihubArticleUrl(host, doi) {
 }
 
 /**
+ * Is this the "paper is not yet available in my database" page?
+ *
+ * Sci-Hub serves it as HTTP 200 with a similar-articles list and a link to the Sci-Net
+ * request platform, so the status code says nothing. It is the ONE answer that lets the
+ * probe skip a host WITHOUT opening a tab: no download link will ever render on this page,
+ * whatever its JS does.
+ *
+ * The inverse test would be a bug. The mere ABSENCE of a pdf link in the static html proves
+ * nothing -- the real link is often written by the page's own script or carried on a `src`
+ * rather than an `href`, which is the entire reason a tab is used here at all. Skipping on
+ * absence would silently lose papers Sci-Hub actually has, a worse outcome than the stray
+ * tab this probe exists to avoid.
+ *
+ * Markers ported from src/publishers/scihub-retrieval.js, where they serve the same purpose.
+ * Pure; never throws.
+ */
+function isScihubUnavailableHtml(html) {
+  if (typeof html !== 'string' || !html) return false;
+  const h = html.toLowerCase();
+  return (
+    h.includes('not yet available in my database')
+    || h.includes('sci-net.xyz')
+    || ((h.includes('what can i do') && h.includes('similar')) && !h.includes('class="download"'))
+  );
+}
+
+/**
  * Pick the PDF out of a Sci-Hub page's links. The href comes from an untrusted page, so the
  * caller MUST still put it through the tier resolver -- this chooses, it does not grant.
  */
@@ -3029,12 +3214,17 @@ async function libgenPdfUrl(doi) {
   const edition = /edition\.php\?id=(\d+)/.exec(search.body);
   if (!edition) return null;
 
+  // Each remaining hop is checked against the phase ceiling. These three run AFTER
+  // firstReachable has already spent its own budget, and none of them used to be bounded at
+  // all, so the chain could add another minute to a phase that was already over.
+  if (mirrorPhaseExhausted()) return null;
   const editionBody = await getTextMirror(`${base}/edition.php?id=${edition[1]}`);
   if (!editionBody) return null;
 
   const ads = hrefsIn(editionBody).find((h) => /ads\.php\?md5=/i.test(h));
   if (!ads) return null;
 
+  if (mirrorPhaseExhausted()) return null;
   const adsBody = await getTextMirror(absolutize(ads, base) || `${base}/${ads.replace(/^\/+/, '')}`);
   if (!adsBody) return null;
 

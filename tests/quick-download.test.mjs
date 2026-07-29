@@ -20,11 +20,14 @@ const src = readFileSync(join(repoRoot, 'extension/background.js'), 'utf8');
  * `fetch` is optional and defaults to a refusal, so the tests that do not care about the
  * network cannot accidentally reach it.
  */
-function load(downloads = {}, fetchImpl = null) {
+function load(downloads = {}, fetchImpl = null, tabsWork = false) {
   const created = [];
   // The download is only finished when Chrome says so, so the stub must model the terminal
   // state as well as the call. `state` picks which one it reports.
   const listeners = new Set();
+  const createdListeners = new Set();
+  const removedFiles = [];
+  const erased = [];
   const chrome = {
     downloads: {
       async download(opts) {
@@ -39,11 +42,35 @@ function load(downloads = {}, fetchImpl = null) {
         addListener(f) { listeners.add(f); },
         removeListener(f) { listeners.delete(f); },
       },
+      // Chrome starts these ITSELF when a navigation lands on a Content-Disposition
+      // response. The worker watches them so it can clean up a file nobody asked for.
+      onCreated: {
+        addListener(f) { createdListeners.add(f); },
+        removeListener(f) { createdListeners.delete(f); },
+      },
+      async removeFile(id) { removedFiles.push(id); },
+      async erase(q) { erased.push(q); },
     },
+    // A tab stub that REFUSES by default.
+    //
+    // Deliberate: with a working chrome.tabs, every ladder test actually enters the tab wait
+    // and sits out the full budget, turning a 30s suite into one that hangs for minutes. The
+    // ladder tests care about the ORDER sources are tried in, which a refusal establishes
+    // just as well as a timeout. Only the stray-download test needs the tab path to open, and
+    // it asks for it explicitly and pairs it with a 1ms budget.
     tabs: {
-      onCreated: { addListener() {} },
-      onUpdated: { addListener() {} },
-      onRemoved: { addListener() {} },
+      onCreated: { addListener() {}, removeListener() {} },
+      onUpdated: { addListener() {}, removeListener() {} },
+      onRemoved: { addListener() {}, removeListener() {} },
+      async create() {
+        if (!tabsWork) throw new Error('no tabs in this test');
+        return { id: 1 };
+      },
+      async get() { return { id: 1, url: '' }; },
+      async query() { return []; },
+      async update() {},
+      async reload() {},
+      async remove() {},
     },
     alarms: { create() {}, clear() {}, onAlarm: { addListener() {} } },
     runtime: {
@@ -58,7 +85,8 @@ function load(downloads = {}, fetchImpl = null) {
   };
   const f = new Function(
     'chrome', 'console', 'URL', 'fetch',
-    `${src}\nreturn { pdfFilename, downloadToBrowser, retrievePaper, parseDownloadInput };`,
+    `${src}\nreturn { pdfFilename, downloadToBrowser, retrievePaper, parseDownloadInput, fetchPdf,`
+    + `\n  mirrorPhaseDeadline: () => mirrorPhaseDeadline };`,
   );
   const api = f(
     chrome,
@@ -75,7 +103,16 @@ function load(downloads = {}, fetchImpl = null) {
     URL,
     fetchImpl || (async () => { throw new Error('the network is not available in this test'); }),
   );
-  return { ...api, created };
+  return {
+    ...api,
+    created,
+    removedFiles,
+    erased,
+    // Pretend Chrome saved a file on its own, the way a navigation at a
+    // Content-Disposition response does.
+    emitBrowserDownload: (id) => { for (const f of createdListeners) f({ id }); },
+    watching: () => createdListeners.size > 0,
+  };
 }
 
 test('a title becomes the filename', () => {
@@ -253,4 +290,55 @@ test('all three phases run in order: mirrors, then open access, then the publish
 
   const order = out.attempts.map((a) => a.source);
   assert.deepEqual(order, ['scihub', 'annas', 'libgen', 'direct', 'nature'], order.join(' -> '));
+});
+
+test('the mirror phase ceiling is cleared when the phase ends', async () => {
+  // The ceiling bounds every mirror helper to the PHASE rather than to its own budget. Left
+  // set, it would still hold the FINISHED call's deadline -- a moment already in the past --
+  // so every later download would skip its mirrors outright and never say why. It is cleared
+  // in a finally, which has to cover the paths that RETURN a pdf as well as the failures.
+  const api = load({}, async () => { throw new Error('offline'); });
+  assert.equal(api.mirrorPhaseDeadline(), 0, 'should start unset');
+  await api.retrievePaper({ doi: '10.1038/nature12373', email: 'a@b.c' });
+  assert.equal(api.mirrorPhaseDeadline(), 0, 'left set after the phase ended');
+});
+
+test('a file Chrome saved by itself is erased, not left in Downloads', async () => {
+  // The navigate branches point the tab AT the pdf to force a document request. When the
+  // response carries a Content-Disposition, Chrome SAVES it -- nothing here asked it to.
+  // Unerased, the user gets a file under Chrome's own name for a paper that may well have
+  // failed, which is the "it downloaded a pdf but kept opening websites" report.
+  //
+  // removeFile BEFORE erase: erase alone drops the history row and orphans the bytes on
+  // disk, which would be worse than leaving it alone.
+  // Driven through fetchPdf, which is where the navigation (and so the stray) happens.
+  // A url on a granted mirror host, so the tier gate lets the call reach the tab path.
+  const api = load({}, async () => { throw new Error('offline'); }, true);
+  // budgetMs is tiny so the tab wait gives up at once: this test is about the CLEANUP that
+  // runs afterwards, not about clearing a challenge.
+  const done = api.fetchPdf({ url: 'https://libgen.bz/get.php?md5=x&key=y', budgetMs: 1 });
+  // The listener is registered synchronously by fetchPdf before it awaits, so by here
+  // Chrome's own download is observable exactly as it would be in the browser.
+  assert.equal(api.watching(), true, 'fetchPdf did not start watching for stray downloads');
+  api.emitBrowserDownload(4242);
+  await done;
+
+  assert.deepEqual(api.removedFiles, [4242], 'the stray file was not removed from disk');
+  assert.deepEqual(api.erased, [{ id: 4242 }], 'the stray history row was not erased');
+  assert.equal(api.watching(), false, 'the onCreated listener outlived the call');
+});
+
+test('a retrieval with no DOI does not poison the next call\'s mirror phase', async () => {
+  // The no-DOI path SKIPS the mirror phase, so it is the one route that can set the ceiling
+  // and never reach the code that clears it. Left set, it holds a timestamp that is already
+  // in the past, and every later call then skips its mirrors outright while reporting
+  // nothing unusual -- mirrors would simply stop working for the rest of the session.
+  const api = load({}, async () => { throw new Error('offline'); });
+  await api.retrievePaper({ pdfUrl: 'https://arxiv.org/pdf/2301.00001' });
+  assert.equal(api.mirrorPhaseDeadline(), 0, 'the no-doi path left the ceiling set');
+
+  // And prove the consequence, not just the flag: the mirrors must still run afterwards.
+  const out = await api.retrievePaper({ doi: '10.1038/nature12373', email: 'a@b.c' });
+  const order = out.attempts.map((a) => a.source);
+  assert.deepEqual(order.slice(0, 3), ['scihub', 'annas', 'libgen'], order.join(' -> '));
 });

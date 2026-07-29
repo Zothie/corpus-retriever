@@ -75,9 +75,39 @@ async function getTextMirror(url, timeoutMs = FETCH_TIMEOUT_MS_MIRROR) {
  */
 let lastMirrorError = null;
 
+/**
+ * The mirror PHASE's deadline, as an absolute timestamp, or 0 when no phase is running.
+ *
+ * Every mirror helper is bounded by its own budget AND by this. Without the second bound the
+ * per-source budgets simply add up: a source allowed to start with a little time left ran its
+ * own independent 45s walk, and libgen then did three further 20s hops on top, so a phase
+ * meant to last 90s could run for minutes -- opening a tab at each step, which is what the
+ * user saw as "it kept opening websites".
+ *
+ * Module-level rather than threaded through every signature because the helpers call each
+ * other several levels deep; a parameter would have to be passed through functions that have
+ * no other use for it, and any one omission silently restores the unbounded behaviour.
+ */
+let mirrorPhaseDeadline = 0;
+
+function setMirrorPhaseDeadline(at) {
+  mirrorPhaseDeadline = typeof at === 'number' && at > 0 ? at : 0;
+}
+
+/** The soonest of a local budget and the phase ceiling. */
+function boundedDeadline(localBudgetMs) {
+  const local = Date.now() + localBudgetMs;
+  return mirrorPhaseDeadline > 0 ? Math.min(local, mirrorPhaseDeadline) : local;
+}
+
+/** True when the phase ceiling has passed, for the hops that have no budget of their own. */
+function mirrorPhaseExhausted() {
+  return mirrorPhaseDeadline > 0 && Date.now() > mirrorPhaseDeadline;
+}
+
 async function firstReachable(hosts, pathFor) {
   let lastError = null;
-  const deadline = Date.now() + SOURCE_BUDGET_MS_MIRROR;
+  const deadline = boundedDeadline(SOURCE_BUDGET_MS_MIRROR);
   for (const host of hosts) {
     // Stop walking once the budget is gone: 14 hosts at 12s each is minutes, and the
     // remaining ones are no more likely to answer than the ones that just did not.
@@ -132,6 +162,33 @@ export function scihubArticleUrl(host, doi) {
 }
 
 /**
+ * Is this the "paper is not yet available in my database" page?
+ *
+ * Sci-Hub serves it as HTTP 200 with a similar-articles list and a link to the Sci-Net
+ * request platform, so the status code says nothing. It is the ONE answer that lets the
+ * probe skip a host WITHOUT opening a tab: no download link will ever render on this page,
+ * whatever its JS does.
+ *
+ * The inverse test would be a bug. The mere ABSENCE of a pdf link in the static html proves
+ * nothing -- the real link is often written by the page's own script or carried on a `src`
+ * rather than an `href`, which is the entire reason a tab is used here at all. Skipping on
+ * absence would silently lose papers Sci-Hub actually has, a worse outcome than the stray
+ * tab this probe exists to avoid.
+ *
+ * Markers ported from src/publishers/scihub-retrieval.js, where they serve the same purpose.
+ * Pure; never throws.
+ */
+export function isScihubUnavailableHtml(html) {
+  if (typeof html !== 'string' || !html) return false;
+  const h = html.toLowerCase();
+  return (
+    h.includes('not yet available in my database')
+    || h.includes('sci-net.xyz')
+    || ((h.includes('what can i do') && h.includes('similar')) && !h.includes('class="download"'))
+  );
+}
+
+/**
  * Pick the PDF out of a Sci-Hub page's links. The href comes from an untrusted page, so the
  * caller MUST still put it through the tier resolver -- this chooses, it does not grant.
  */
@@ -179,12 +236,17 @@ export async function libgenPdfUrl(doi) {
   const edition = /edition\.php\?id=(\d+)/.exec(search.body);
   if (!edition) return null;
 
+  // Each remaining hop is checked against the phase ceiling. These three run AFTER
+  // firstReachable has already spent its own budget, and none of them used to be bounded at
+  // all, so the chain could add another minute to a phase that was already over.
+  if (mirrorPhaseExhausted()) return null;
   const editionBody = await getTextMirror(`${base}/edition.php?id=${edition[1]}`);
   if (!editionBody) return null;
 
   const ads = hrefsIn(editionBody).find((h) => /ads\.php\?md5=/i.test(h));
   if (!ads) return null;
 
+  if (mirrorPhaseExhausted()) return null;
   const adsBody = await getTextMirror(absolutize(ads, base) || `${base}/${ads.replace(/^\/+/, '')}`);
   if (!adsBody) return null;
 
