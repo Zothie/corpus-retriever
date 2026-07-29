@@ -27,7 +27,11 @@ const realFetch = globalThis.fetch;
 function stubFetch(handler) { globalThis.fetch = async (url, opts) => handler(String(url), opts || {}); }
 test.afterEach(() => { globalThis.fetch = realFetch; });
 
-const textRes = (body) => ({ ok: true, status: 200, text: async () => body });
+// `url` models where the response CAME FROM after redirects, which the real fetch reports
+// and this stub used to omit entirely. Anna's says "I do not hold this" only by redirecting,
+// so a stub without it cannot express a miss -- and the suite duly stayed green while the
+// extension opened a tab for every DOI. Defaults to the requested url, i.e. no redirect.
+const textRes = (body, url) => ({ ok: true, status: 200, url, text: async () => body });
 
 test('the live list shape is parsed, trailing slashes and BOM included', async () => {
   // Exactly what the CDN returned when measured: a BOM, bare hosts, trailing slashes.
@@ -192,13 +196,37 @@ test('libgen yields null when every mirror is down, without throwing', async () 
 
 // --- Anna's Archive ---------------------------------------------------------------------
 
+// What Anna's actually does, measured live 2026-07-29 -- and it is a REDIRECT, not wording.
+//
+// It answers 200 for every /scidb/ url, so the status says nothing. A paper it holds stays
+// on /scidb/; a paper it does not hold bounces to /search?index=journals&q="doi:...", which
+// followed is a 591 KB results page full of other papers' md5s. That is why the verdict is
+// taken from the FINAL URL: every content-based test either rejected real hits (there is no
+// download href server-side; the viewer is client-built) or accepted the search page.
+//
+// `<html></html>` was the fixture here while any HTTP 200 counted as a hit. It cannot be any
+// more, and that is the point: reachable is not the same as has-it.
+const ANNAS_RECORD = '<html><title>Some Paper - Anna\u2019s Archive</title></html>';
+const ANNAS_SEARCH = '<html><title>"doi:x" - Search - Anna\u2019s Archive</title></html>';
+const annasHit = (host, path) => textRes(ANNAS_RECORD, `https://${host}${path}`);
+const annasMiss = (host) => textRes(ANNAS_SEARCH, `https://${host}/search?index=journals&q=x`);
+
 test("anna's keeps the DOI slash literal", async () => {
   // encodeURIComponent would send 10.1016%2Fj..., which Anna's accepts (both forms return
   // the same 108,784-byte page) but which is not the form the site links to itself.
-  stubFetch(async () => textRes('<html></html>'));
+  stubFetch(async (url) => annasHit(new URL(url).host, new URL(url).pathname));
   const out = await annasArticleUrl('10.1016/j.jfineco.2019.05.005');
   assert.equal(out, 'https://annas-archive.gd/scidb/10.1016/j.jfineco.2019.05.005');
   assert.doesNotMatch(out, /%2F/i);
+});
+
+test("anna's answering for a paper it does NOT hold opens no tab", async () => {
+  // The reported bug: annasArticleUrl returned a page url whenever a HOST was up, because
+  // Anna's answers 200 for every /scidb/ url. The caller then opened a tab to read links
+  // that were never going to be there -- the user watched a window appear for a paper they
+  // had already downloaded from somewhere else.
+  stubFetch(async (url) => annasMiss(new URL(url).host));
+  assert.equal(await annasArticleUrl('10.5555/nope'), null);
 });
 
 test("anna's picks a file link out of a hydrated page", () => {
@@ -275,13 +303,23 @@ test('an unrecognised mirror name is unknown', async () => {
   assert.equal(await probeMirror('nosuchmirror', '10.1/x'), 'unknown');
 });
 
-test("anna's resolving is present, and failing to resolve is UNKNOWN not absent", async () => {
-  stubFetch(async () => textRes('<html></html>'));
+test("anna's is present, absent, or unknown -- and a dead host is never absent", async () => {
+  stubFetch(async (url) => annasHit(new URL(url).host, new URL(url).pathname));
   assert.equal(await probeMirror('annas', '10.1/x'), 'present');
 
-  // THE rule most likely to be broken later. annasArticleUrl returns null both for "not
-  // found" and for "no mirror answered", so null can never be reported as a negative.
+  // A DEFINITIVE negative: the host answered, and its answer was the redirect stub it
+  // serves for papers it does not hold. Acting on this is what keeps the ladder from
+  // opening a tab, and it is only sound because the page itself said so.
+  stubFetch(async (url) => annasMiss(new URL(url).host));
+  assert.equal(await probeMirror('annas', '10.1/x'), 'absent');
+
+  // THE rule most likely to be broken later, and the reason 'absent' has to be earned:
+  // nothing answered at all, which says nothing whatever about the paper.
   stubFetch(async () => { throw new TypeError('Failed to fetch'); });
+  assert.equal(await probeMirror('annas', '10.1/x'), 'unknown');
+
+  // A rate limit is not a verdict either.
+  stubFetch(async () => ({ ok: false, status: 429 }));
   assert.equal(await probeMirror('annas', '10.1/x'), 'unknown');
 });
 
@@ -304,7 +342,7 @@ test("anna's falls through to the next mirror", async () => {
     const host = new URL(url).hostname;
     tried.push(host);
     if (host === 'annas-archive.gd') throw new TypeError('Failed to fetch');
-    return textRes('<html></html>');
+    return annasHit(host, new URL(url).pathname);
   });
   const out = await annasArticleUrl('10.1/x');
   assert.match(out, /annas-archive\.pk/);

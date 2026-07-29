@@ -54,11 +54,24 @@ const SOURCE_BUDGET_MS_MIRROR = 45000;
 const FETCH_TIMEOUT_MS_MIRROR = 20000;
 
 /** Fetch text with a timeout, through the tier resolver. Never throws. */
-async function getTextMirror(url, timeoutMs = FETCH_TIMEOUT_MS_MIRROR) {
+/**
+ * Fetch a mirror page as text, or null.
+ *
+ * `info` is an optional out-parameter: when given, `info.finalUrl` is set to the url the
+ * response actually came from. A redirect is the only way Anna's says "I do not have this
+ * paper" -- it answers 200 for every /scidb/ url and bounces the misses to /search -- and a
+ * caller that sees only the body cannot tell a hit from a miss.
+ *
+ * An out-parameter rather than a richer return value, because the body is returned as a
+ * plain string to several callers that type-check it (`typeof html !== 'string'`). Wrapping
+ * it would make those checks fail silently, which is a worse bug than the one being fixed.
+ */
+async function getTextMirror(url, timeoutMs = FETCH_TIMEOUT_MS_MIRROR, info = null) {
   const credentials = credentialsFor(url);
   if (credentials === null) return null;
   try {
     const res = await fetch(url, { credentials, signal: AbortSignal.timeout(timeoutMs) });
+    if (info) info.finalUrl = res.url || url;
     if (!res.ok) { lastMirrorError = `http ${res.status}`; return null; }
     return await res.text();
   } catch (err) {
@@ -116,8 +129,11 @@ async function firstReachable(hosts, pathFor) {
       return null;
     }
     if (urlTier(`https://${host}/`) !== TIER.ANONYMOUS) continue;
-    const body = await getTextMirror(`https://${host}${pathFor(host)}`, PROBE_TIMEOUT_MS_MIRROR);
-    if (body !== null) return { host, body };
+    const info = {};
+    const body = await getTextMirror(
+      `https://${host}${pathFor(host)}`, PROBE_TIMEOUT_MS_MIRROR, info,
+    );
+    if (body !== null) return { host, body, finalUrl: info.finalUrl };
   }
   if (lastError) lastMirrorError = lastError;
   return null;
@@ -276,7 +292,44 @@ export async function annasArticleUrl(doi) {
   // need escaping are escaped.
   const path = `/scidb/${doi.split('/').map(encodeURIComponent).join('/')}`;
   const hit = await firstReachable(ANNAS_MIRRORS, () => path);
-  return hit ? `https://${hit.host}${path}` : null;
+  if (!hit) return null;
+  // Reachable is not the same as HAS IT, and conflating the two opened a tab for every DOI.
+  //
+  // Anna's answers 200 for any /scidb/ url, so firstReachable -- which only asks whether a
+  // host responded -- said yes even for papers it does not hold. The caller then opened a
+  // tab to read links that were never going to be there. The user saw a window appear for a
+  // paper already downloaded from another source.
+  if (!isAnnasRecordUrl(hit.finalUrl)) return null;
+  return `https://${hit.host}${path}`;
+}
+
+/**
+ * Does this scidb response describe a record Anna's actually holds?
+ *
+ * Measured live 2026-07-29. Anna's answers 200 for EVERY /scidb/ url, so the status code is
+ * worthless here. What it does instead is REDIRECT: a paper it does not hold bounces to
+ * `/search?index=journals&q="doi:..."`, while a paper it holds stays on /scidb/.
+ *
+ * The final url is the test, deliberately, and not the page's wording. Two earlier attempts
+ * at this were wrong for instructive reasons:
+ *
+ *   - "does the html contain a download link" rejects EVERYTHING, because the viewer is
+ *     built client-side and no href exists in the server-rendered html even for a hit --
+ *     which is the whole reason this path needs a tab at all.
+ *   - "does it say Redirecting" only works on an UNFOLLOWED response. Followed, the stub
+ *     becomes a 591 KB search-results page with no such wording and plenty of md5s in the
+ *     results, so that check passed the miss straight through.
+ *
+ * `url` is the FINAL url after redirects; `html` is unused for the verdict and kept only so
+ * callers need not care which they have.
+ */
+export function isAnnasRecordUrl(url) {
+  if (typeof url !== 'string' || !url) return false;
+  try {
+    return new URL(url).pathname.startsWith('/scidb/');
+  } catch {
+    return false;
+  }
 }
 
 // --- availability probe -----------------------------------------------------------------
@@ -321,7 +374,17 @@ export async function probeMirror(name, doi) {
       }
       return 'unknown';                            // nothing answered
     }
-    if (name === 'annas') return (await annasArticleUrl(doi)) ? 'present' : 'unknown';
+    if (name === 'annas') {
+      // Not annasArticleUrl: it collapses "no mirror answered" and "answered, does not hold
+      // it" into the same null, and those are different claims. Only the second is a
+      // definitive negative worth acting on.
+      const path = `/scidb/${doi.split('/').map(encodeURIComponent).join('/')}`;
+      const hit = await firstReachable(ANNAS_MIRRORS, () => path);
+      if (!hit) return 'unknown';
+      return isAnnasRecordUrl(hit.finalUrl) ? 'present' : 'absent';
+    }
+    // libgen stays two-valued: libgenPdfUrl returns null both for "not indexed" and for
+    // "the mirror chain broke half way", and nothing in its response separates them.
     if (name === 'libgen') return (await libgenPdfUrl(doi)) ? 'present' : 'unknown';
   } catch {
     return 'unknown';
