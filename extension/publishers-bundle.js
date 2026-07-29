@@ -195,13 +195,46 @@ function cachedPii(doi) {
 }
 
 /**
- * Default resolver: follow doi.org and report where we landed.
+ * Default resolver: ask Crossref where the DOI points, and fall back to following doi.org.
  *
  * A resolver's job is to produce the final URL, not to parse it -- elsevierPii extracts
  * the PII. Keeping the split here means an injected resolver is just "what does this DOI
  * redirect to", which is the thing a test can state without knowing PII syntax.
  */
 async function elsevier_pii$resolveViaDoiOrg(doi, { signal } = {}) {
+  // CROSSREF FIRST, because in a browser it is the only one of the two that can work.
+  //
+  // The doi.org hop below redirects to linkinghub.elsevier.com, and elsevier.com is
+  // deliberately NOT allowlisted -- it is only ever a redirect target, and the Node client
+  // follows it server-side where CORS does not apply. Inside the extension's service worker
+  // it does apply, and a redirect target needs its OWN host_permissions grant, which
+  // doi.org's does not extend to. So the request was refused every time:
+  //
+  //   Access to fetch at 'https://linkinghub.elsevier.com/retrieve/pii/S0092867414006047'
+  //   (redirected from 'https://doi.org/10.1016/j.cell.2014.05.010') has been blocked by
+  //   CORS policy
+  //
+  // It failed QUIETLY: the caller memoises null, the publisher reports "could not resolve
+  // an identifier", and the paper is simply not found. And it was the only path for exactly
+  // the DOIs the offline Cell table can classify, since deciding offline skips the Crossref
+  // lookup that would have produced the same PII for free.
+  //
+  // Crossref carries the identical linkinghub url in resource.primary.URL, is already
+  // allowlisted, and serves CORS headers. Measured 2026-07-29: it returns
+  // .../pii/S0092867414006047 for the DOI above.
+  await paperRateLimiter.acquire('crossref', { signal }).catch(() => {});
+  try {
+    const res = await fetch(`https://api.crossref.org/works/${encodeURI(doi)}`, { signal });
+    if (res.ok) {
+      const body = await res.json();
+      const url = body?.message?.resource?.primary?.URL;
+      if (typeof url === 'string' && url) return url;
+    }
+  } catch {
+    // Crossref down, rate-limiting, or refusing: fall through to the redirect, which still
+    // works from Node even though it cannot from the worker.
+  }
+
   await paperRateLimiter.acquire('doi-org', { signal }).catch(() => {});
   // HEAD is enough -- we only want the final URL, never the body. redirect:'follow' walks
   // doi.org -> linkinghub and stops there, which is exactly the hop that carries the PII.
