@@ -9,11 +9,13 @@
     "build:mirrors": "node scripts/build-store-package.mjs --with-mirrors",
     "test": "node --test tests/",
     "vendor:qpdf": "node scripts/vendor-qpdf.mjs",
-    "check": "node --check extension/background.js && node --check extension/popup.js"
+    "check": "node --check extension/background.js && node --check extension/popup.js",
+    "test:live": "node tests/search-live.mjs"
   },
   "devDependencies": {
     "@neslinesli93/qpdf-wasm": "^0.3.0",
     "axios": "^1.7.7",
-    "xml2js": "^0.6.2"
+    "xml2js": "^0.6.2",
+    "playwright": "1.61.1"
   }
 }
