@@ -83,10 +83,19 @@ export async function slimPdf(bytes, runQpdf = runQpdfWasm) {
 // Wrapped because a throw at top level would take the WHOLE worker down -- the ladder, the
 // bridge, the popup -- to save a few kilobytes on a download. If the glue is missing,
 // slimming is simply unavailable and slimPdf keeps returning originals.
-try {
-  self.importScripts(chrome.runtime.getURL('vendor/qpdf.js'));
-} catch (err) {
-  console.warn('[slim-pdf] qpdf glue did not load, downloads will not be slimmed:', err);
+//
+// The `typeof` guard is what makes ONE source tree serve both browsers. Firefox has no MV3
+// service worker: the background is an event PAGE, importScripts does not exist there, and
+// the glue arrives instead as an entry in `background.scripts` ordered ahead of this file.
+// Either way `Module` is a global by the time loadQpdf runs, so nothing below this changes.
+// The guard must stay at top level and out of any function for the Chrome reason above --
+// tests/vendor-qpdf.test.mjs asserts exactly that by counting brace depth.
+if (typeof self !== 'undefined' && typeof self.importScripts === 'function') {
+  try {
+    self.importScripts(chrome.runtime.getURL('vendor/qpdf.js'));
+  } catch (err) {
+    console.warn('[slim-pdf] qpdf glue did not load, downloads will not be slimmed:', err);
+  }
 }
 
 /**

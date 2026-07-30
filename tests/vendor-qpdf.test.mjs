@@ -33,25 +33,32 @@ test('importScripts of the glue happens at TOP LEVEL, not inside a function', ()
   assert.ok(at !== -1, 'slim-pdf.js no longer loads the glue at all');
 
   // Brace depth, not indentation. Indentation is cosmetic and a nested call can be written
-  // at any column; only the depth says whether this runs during initial evaluation. The
-  // one wrapper allowed is the top-level try/catch that keeps a missing glue from taking
-  // the whole worker down, so depth must be 0 or 1.
+  // at any column; only the depth says whether this runs during initial evaluation. Two
+  // wrappers are allowed, and both are unconditional blocks that still run during initial
+  // evaluation: the `typeof self.importScripts === 'function'` guard that lets Firefox --
+  // whose MV3 background is an event page with no importScripts -- load the same file, and
+  // inside it the try/catch that keeps a missing glue from taking the whole worker down.
+  // A FUNCTION at any depth is still fatal, which is what the assertion below catches.
+  // Strip strings and line comments FIRST, then reason about the result. Both checks below
+  // read this same stripped text: the prose above and the `typeof x === 'function'` guard
+  // both contain the word "function" and a brace, and matching either is a false failure.
+  const preamble = lines.slice(0, at)
+    .map((line) => line.replace(/'[^']*'|"[^"]*"|`[^`]*`/g, '').replace(/\/\/.*$/, ''));
+
   let depth = 0;
-  for (const line of lines.slice(0, at)) {
-    // Strip strings and line comments first, so a brace inside either does not count.
-    const code = line.replace(/'[^']*'|"[^"]*"|`[^`]*`/g, '').replace(/\/\/.*$/, '');
-    for (const ch of code) {
+  for (const line of preamble) {
+    for (const ch of line) {
       if (ch === '{') depth += 1;
       else if (ch === '}') depth -= 1;
     }
   }
   assert.ok(
-    depth <= 1,
+    depth <= 2,
     `importScripts runs at brace depth ${depth}: it must load during initial worker `
     + 'evaluation, not from inside a function',
   );
   assert.doesNotMatch(
-    lines.slice(0, at).join('\n'),
+    preamble.join('\n'),
     /(async\s+)?function[^\n]*\{[^}]*$/,
     'importScripts sits inside a function declaration',
   );

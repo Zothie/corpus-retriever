@@ -1,7 +1,13 @@
-// Build a Chrome Web Store upload package.
+// Build a browser-store upload package.
 //
-//   node scripts/build-store-package.mjs              store-safe (default)
-//   node scripts/build-store-package.mjs --with-mirrors
+//   node scripts/build-store-package.mjs                          Chrome, store-safe (default)
+//   node scripts/build-store-package.mjs --with-mirrors           Chrome, full
+//   node scripts/build-store-package.mjs --firefox                Firefox (AMO), store-safe
+//   node scripts/build-store-package.mjs --firefox --with-mirrors Firefox (AMO), full
+//
+// The two targets cross with the mirror axis, giving four artifacts from ONE source tree.
+// --firefox differs only in the manifest (see scripts/firefox-manifest.mjs): the 6,900-line
+// worker is shared verbatim, because it uses no service-worker-only API.
 //
 // The unpacked development copy and a Store submission are NOT the same artifact, and the
 // differences are not cosmetic:
@@ -26,17 +32,27 @@ import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
+import { firefoxManifest, GECKO_ID, MIN_FIREFOX } from './firefox-manifest.mjs';
 
 const run = promisify(execFile);
 const repoRoot = join(dirname(fileURLToPath(import.meta.url)), '..');
 const src = join(repoRoot, 'extension');
 const outDir = join(repoRoot, 'dist-store');
-const stage = join(outDir, 'extension');
 
 const withMirrors = process.argv.includes('--with-mirrors');
+const firefox = process.argv.includes('--firefox');
+
+// Stage per TARGET, not one shared directory.
+//
+// dist-store/extension was shared by every build mode, and since the script starts by
+// removing outDir, building two artifacts in a row left only the second -- both zips
+// existed but described the same tree. That was caught by unzipping a finished package,
+// after the wrong one had already been identified as the upload.
+const stage = join(outDir, firefox ? 'extension-firefox' : 'extension');
 const MIRROR_RE = /sci-hub|libgen|annas-archive|lowyiyiu/i;
 
-await rm(outDir, { recursive: true, force: true });
+// Only THIS target's stage, so building all four in sequence keeps all four zips.
+await rm(stage, { recursive: true, force: true });
 await mkdir(stage, { recursive: true });
 await cp(src, stage, {
   recursive: true,
@@ -105,10 +121,16 @@ if (!withMirrors) {
 }
 
 const manifestPath = join(stage, 'manifest.json');
-const manifest = JSON.parse(await readFile(manifestPath, 'utf8'));
+let manifest = JSON.parse(await readFile(manifestPath, 'utf8'));
 
-// The Store assigns the id. Keeping `key` pins one it did not issue.
-delete manifest.key;
+if (firefox) {
+  // Swaps the service worker for an event page, drops `key`, and adds the Gecko id and the
+  // 127 floor. Everything else -- permissions, host_permissions, action, CSP -- carries over.
+  manifest = firefoxManifest(manifest);
+} else {
+  // The Store assigns the id. Keeping `key` pins one it did not issue.
+  delete manifest.key;
+}
 
 const before = manifest.host_permissions.length;
 if (!withMirrors) {
@@ -152,12 +174,39 @@ if (!withMirrors) {
   }
 }
 
-const zip = join(outDir, `corpus-retriever-${manifest.version}${withMirrors ? '-mirrors' : ''}.zip`);
+// Verify the FIREFOX background files exist, before zipping rather than after installing.
+//
+// background.scripts names the qpdf glue and the worker by path. If the glue was never
+// vendored (`npm run vendor:qpdf`), Firefox fails the whole background page rather than
+// just skipping slimming -- so a missing file here costs the extension everything, and it
+// is invisible until load. Chrome reaches the same file through importScripts inside a
+// try/catch, which is why this check is Firefox-only.
+if (firefox) {
+  const missing = [];
+  for (const rel of manifest.background.scripts) {
+    if (!existsSync(join(stage, rel))) missing.push(rel);
+  }
+  if (missing.length > 0) {
+    console.error(`REFUSING TO BUILD: background.scripts names ${missing.length} missing file(s):`);
+    for (const m of missing) console.error(`  ${m}`);
+    console.error('If it is vendor/qpdf.js, run: npm run vendor:qpdf');
+    process.exit(1);
+  }
+}
+
+// .xpi for Firefox, .zip for Chrome. An xpi IS a zip; AMO accepts either extension, but the
+// suffix is what keeps the four artifacts in dist-store/ telling each other apart at a glance.
+const ext = firefox ? 'xpi' : 'zip';
+const suffix = `${firefox ? '-firefox' : ''}${withMirrors ? '-mirrors' : ''}`;
+const zip = join(outDir, `corpus-retriever-${manifest.version}${suffix}.${ext}`);
+await rm(zip, { force: true });
 await run('zip', ['-r', '-q', zip, '.'], { cwd: stage });
 
 console.log(`package: ${zip}`);
+console.log(`target:  ${firefox ? `Firefox ${MIN_FIREFOX}+ (event page)` : 'Chrome (service worker)'}`);
 console.log(`version: ${manifest.version}`);
 console.log(`hosts:   ${manifest.host_permissions.length} (${removed} mirror hosts removed)`);
+if (firefox) console.log(`id:      ${GECKO_ID}`);
 if (withMirrors) {
   console.log('WARNING: mirror hosts included. Rejection or later removal is likely.');
 }
