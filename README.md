@@ -25,16 +25,22 @@ minute and failing.
 ## Setting it up
 
 1. Install the extension.
-2. Click the toolbar icon, open **Settings**, and enter your email address.
-3. That's it.
+2. That's it.
 
-**The email matters more than it looks.** Two of the big free-paper libraries (Unpaywall and
-PubMed Central) refuse to answer requests that do not include a contact address — it is how
-they prevent abuse. Without it, the extension has to skip them entirely and every download
-becomes slower and more likely to fail. Your address goes only to those libraries. It is never
-sent to us, and there is no "us" to send it to — no server, no account, no analytics.
+Nothing to configure, no account to make. Two of the big free-paper libraries (Unpaywall and
+PubMed Central) refuse requests that carry no contact address — it is how they attribute load
+and stop one heavy user spoiling it for everyone. That is a fair condition, so the extension
+meets it without asking you for anything: it generates a random identifier once, keeps it
+locally, and sends that.
 
-Once entered, the Settings section hides itself. You only ever do this once.
+It is deliberately **not** a fingerprint of your browser. A fingerprint comes from a small
+enough space to be worked backwards, and it would follow you across unrelated sites; a random
+id tells those two libraries which install is asking and nothing at all about the person. It
+stays the same between requests on purpose — a fresh one each time would be indistinguishable
+from dodging a rate limit, and would leave them unable to slow one install down without
+blocking everybody.
+
+No server, no account, no analytics. There is no "us" for anything to be sent to.
 
 ## Using it
 
@@ -87,24 +93,31 @@ fallback is usually what produces the PDF. Use it knowing that.
 - What you paste goes to the paper libraries and publishers. The PDF goes to your Downloads
   folder. Nothing goes anywhere else.
 
-Full policy: <https://zothie.github.io/corpus-studio/privacy.html>
+Full policy: <https://corpus-hub.github.io/corpus-studio/privacy.html>
 
 ## Where papers come from
 
 It tries sources in order and stops at the first real PDF.
 
-**1. Shadow libraries** — Sci-Hub · Anna's Archive · LibGen
+**1. Free archives** — tried in parallel:
+Unpaywall · OpenAlex · PubMed Central
 
-**2. Free archives** — always readable, tried in parallel:
-Unpaywall · OpenAlex · PubMed Central · CORE
+**2. Shadow libraries** — Sci-Hub · Anna's Archive · LibGen
 
 **3. Publishers** — using your own browser session:
 SSRN · DigitalCommons · Mendeley Data · Cell · ScienceDirect · Nature · Springer · Wiley ·
 ACS · OUP
 
-Publishers come last because they are the only source that can interrupt you: that is the
-step where a tab opens and asks you to prove you are human. Everything ahead of it runs
-silently, so most downloads finish without one.
+Free archives come first because they are fast and they hold more than you would expect —
+plenty of papers that look paywalled are sitting in one of them, and a Nature article came
+back from Unpaywall in two seconds. Measured, a shadow library served the same class of file
+at 23 KB/s against 517 KB/s from an open-access host, so reaching for one first cost fifteen
+seconds on papers that were free all along. LibGen is last of the three for the same reason:
+reliable, and slow enough that it is worth trying everything else first.
+
+Publishers come last because they are the only source that can interrupt you: that is the step
+where a tab opens and asks you to prove you are human. Everything ahead of it runs silently,
+so most downloads finish without one.
 
 **Search** (used by the desktop integration, not the popup): SSRN · arXiv · PubMed ·
 bioRxiv/medRxiv, with Crossref resolving DOIs to titles.
@@ -151,7 +164,7 @@ The extension itself ships **no dependencies** — it is plain MV3 JavaScript. `
 `xml2js` are devDependencies of the Node-side resolvers and their tests only.
 
 ```bash
-npm test        # 132 tests
+npm test        # 139 tests
 npm run check   # syntax-check the worker and the popup
 ```
 
@@ -166,14 +179,21 @@ See `CLAUDE.md` for the rest of the MV3 constraints, each of which has already c
 
 Three phases, and the order is load-bearing:
 
-1. **Mirrors, first** — Sci-Hub, Anna's Archive, LibGen. They hold the paywalled majority and
-   answer without a challenge and without a human, so trying them first is what keeps most
-   downloads from needing a tab at all. Time-boxed as a group so three slow sources cannot
-   make a download look hung.
-2. **Open access, in parallel** — a direct URL if supplied, plus Unpaywall, OpenAlex, PubMed
-   Central, CORE. Nothing here opens a tab or involves a human either.
+1. **Open access, in parallel** — a direct URL if supplied, plus Unpaywall, OpenAlex and PubMed
+   Central. Nothing here opens a tab or involves a human, and it is fast: measured at
+   517 KB/s against 23 KB/s from a mirror, so a paper that is free anywhere arrives in about
+   two seconds. It also holds far more than the word "paywalled" suggests.
+2. **Mirrors** — Sci-Hub, Anna's Archive, LibGen. They answer without a challenge and without
+   a human, so most downloads still finish without a tab. Time-boxed as a group so three slow
+   sources cannot make a download look hung, and LibGen is pinned last of the three: it is
+   reliable and it is slow, so a hint that it has the paper is still not a reason to go there
+   before the others have declined.
 3. **Publishers, in sequence** — last, because this is the only phase that can open a tab and
    park on a human clearing a challenge. It should run only once everything free has missed.
+
+A challenge that a human genuinely has to answer surfaces the tab within twenty seconds, so it
+is seen rather than sitting hidden. A proof-of-work challenge is solved outright instead — it
+is arithmetic, not a puzzle, and there is nothing for a person to look at.
 
 A source failing in a way that looks like a global outage is parked for 30 minutes, so a dead
 domain does not re-cost every later download.
@@ -192,7 +212,7 @@ npm run build           # same, minus the mirrors
 Both write `dist-store/corpus-retriever-<version>.zip` and drop the manifest `key`, so the
 packaged copy gets a fresh extension ID rather than colliding with an unpacked one.
 
-`npm run build` additionally removes phase 3 — code, hostnames and host permissions.
+`npm run build` additionally removes the mirror phase — code, hostnames and host permissions.
 Deleting `mirror-sources.js` is **not** sufficient, because its functions are inlined into
 `background.js`; both regions are fenced with `---8<---` markers and cut, and the script greps
 the finished staging directory and refuses to produce a zip if a single reference survives.
@@ -207,9 +227,16 @@ The extension also answers over Chrome's native messaging, so a local app can re
 instead of the user typing into the panel.
 
 ```
-desktop app --unix socket--> src/bridge/corpus-retriever-host.js --stdio--> extension
+desktop app --local IPC--> src/bridge/corpus-retriever-host.js --stdio--> extension
 ```
 
-[Corpus Studio](https://github.com/Zothie/corpus-studio) uses this. Nothing about the
+The local hop is a **unix socket** on Linux and macOS (`/tmp/ssrn-bridge-<user>/<pid>.sock`,
+one per host so several can coexist) and a **named pipe** on Windows
+(`\\.\pipe\ssrn-bridge-<user>`). Windows has no unix domain sockets, and a pipe name cannot be
+enumerated — so there the name is fixed per user and a second host exits rather than listening
+somewhere nobody would look for it. Both sides derive the address from one definition; two
+copies of that derivation have drifted before and made a live extension look dead.
+
+[Corpus Studio](https://github.com/corpus-hub/corpus-studio) uses this. Nothing about the
 extension depends on it: with no host installed the channel is simply never connected, and the
 toolbar panel works normally.

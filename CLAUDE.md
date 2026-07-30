@@ -1,6 +1,6 @@
 # CLAUDE.md — Corpus Retriever (Chrome extension)
 
-Guidance for Claude Code working in this standalone repo (github.com/Zothie/corpus-retriever).
+Guidance for Claude Code working in this standalone repo (github.com/corpus-hub/corpus-retriever).
 
 IMPORTANT: NEVER USE EMOJIS ANYWHERE IN LOGGING, CODE OR OTHER TEXT!
 
@@ -18,7 +18,8 @@ is re-challenged even holding a valid one.
 Two front doors, one engine:
 
 - **Toolbar popup** (`popup.html`) — the user pastes an identifier and gets a PDF.
-- **Native messaging** — Corpus Studio drives the same retrieval over a unix socket.
+- **Native messaging** — Corpus Studio drives the same retrieval over a local IPC channel: a
+  unix socket on Linux and macOS, a named pipe on Windows.
 
 Both call `runDownload()`. That sharing is deliberate: a download from the toolbar and one
 from the desktop app must produce the same file, the same name and the same failure text.
@@ -88,18 +89,26 @@ vendored files against `node_modules`. Re-run the script after bumping that depe
 
 Order is load-bearing.
 
-1. **Phase 1 — mirrors, FIRST:** scihub, annas, libgen, in that order. They hold the
-   paywalled majority and answer without a challenge and without a human, so trying them
-   before the official routes is what keeps most downloads from needing a tab at all.
-   Bounded as a group (`MIRROR_PHASE_BUDGET_MS`), because three sources at 45s each is longer
-   than a user will believe the thing is still working.
-2. **Phase 2 — open access, in parallel:** a direct URL the caller passed, plus Unpaywall,
-   OpenAlex, PubMed Central, CORE. None opens a tab or involves a human.
-   Unpaywall and PMC **require** a contact email and reject requests without one — with no
-   email the entire phase is skipped and every download goes the slow way.
+1. **Phase 1 — open access, in parallel, FIRST:** a direct URL the caller passed, plus
+   Unpaywall, OpenAlex and PubMed Central. None opens a tab or involves a human.
+   First on measured grounds: an open-access host served at 517 KB/s where a mirror served the
+   same class of file at 23 KB/s, and open access frequently holds a paper that looks
+   paywalled — Nature came back from Unpaywall in 2.0s. Mirrors-first spent 15+ seconds
+   walking sources that were never needed.
+   Unpaywall and PMC **require** a contact address and reject requests without one.
+   `contactEmail()` derives a stable random per-install id so the user is never asked.
+2. **Phase 2 — mirrors:** scihub, annas, libgen. They answer without a challenge and without
+   a human, so most downloads still finish without a tab. Bounded as a group
+   (`MIRROR_PHASE_BUDGET_MS`), because three sources at 45s each is longer than a user will
+   believe the thing is still working. **libgen is pinned LAST** whatever the hints say —
+   measured at 23 KB/s, so a 2.9 MB paper takes 87s there; a "libgen has it" hint is true and
+   still not a reason to go before the others have declined.
 3. **Phase 3 — publishers, sequential:** ssrn, digitalcommons, mendeley, cell, sciencedirect,
    nature, springer, wiley, acs, oup. May open a tab; may need the user to clear a challenge.
    Last because this is the only phase that can cost the user their attention.
+
+CORE is **not** in the ladder. It requires an API key, so without one it returns null and the
+source never runs — a configured-off source rather than a broken one.
 
 A source that fails with a global outage is **parked for 30 minutes** (`parkSource`), so a
 dead domain does not re-cost every subsequent download.
@@ -170,7 +179,7 @@ was on 1.0.2.
 ## Testing
 
 ```bash
-npm test                                   # full suite (132)
+npm test                                   # full suite (139)
 node --test tests/quick-download.test.mjs  # download path
 node --test tests/tab-cleanup.test.mjs     # tab safety — never dismiss a failure here
 npm run check                              # syntax-check worker + popup
@@ -203,7 +212,7 @@ extension/           WHAT CHROME LOADS — load this dir unpacked
 
 src/publishers/      the resolvers in Node form, and the SOURCE of publishers-bundle.js
 src/bridge/
-  corpus-retriever-host.js  native-messaging host: unix socket <-> extension stdio
+  corpus-retriever-host.js  native-messaging host: local IPC (unix socket / named pipe) <-> extension stdio
   allowed-hosts.js      the host's own allowlist copy; re-validates every URL
 src/utils/           logger + the per-source rate limiter for the public academic APIs
 

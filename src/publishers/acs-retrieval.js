@@ -54,10 +54,18 @@ export function acsLandingUrl(id) {
 /**
  * Picks the full text out of an ACS article page.
  *
- * Silverchair's download path is /<journal-code>/article-pdf/doi/..., and the page also
- * links supplementary material as .pdf. Without this the first candidate wins and a
- * supplement gets filed as the paper -- worse than a failed download, because nothing
- * downstream can detect it. Verified live: the jacs.6c07767 page yields exactly
- * https://pubs.acs.org/jacsat/article-pdf/doi/10.1021/jacs.6c07767/66240843/jacs.6c07767.pdf
+ * Silverchair serves the article PDF from /<journal-code>/article-pdf/, and the page also
+ * links supplementary material as .pdf. Matching on `article-pdf` rather than on `.pdf` is
+ * what keeps a supplement from being filed as the paper -- worse than a failed download,
+ * because nothing downstream can detect it.
+ *
+ * TWO shapes, both measured live:
+ *   .../jacsat/article-pdf/doi/10.1021/jacs.6c07767/66240843/jacs.6c07767.pdf
+ *   .../accacs/article-pdf/16/13/12814/65101330/cs-2026-025563.pdf
+ *
+ * The second is the volume/issue form, and requiring `doi/` rejected it -- so a free ACS
+ * paper whose page offered exactly one real PDF link came back as "no link matched this
+ * publisher". Supplements live under /doi/suppl/ and carry no `article-pdf` segment, so
+ * dropping the `doi/` requirement widens this to the article PDF and nothing else.
  */
-export const ACS_PDF_LINK = /\/article-pdf\/doi\//;
+export const ACS_PDF_LINK = /\/article-pdf\//;

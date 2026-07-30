@@ -83,6 +83,10 @@ const VECTORS = [
   ['https://www.onlinelibrary.wiley.com/doi/pdfdirect/10.1002/x', true, 'wiley www subdomain'],
   ['https://pubs.acs.org/doi/pdf/10.1021/acs.est.0c02765', true, 'acs pdf'],
   ['https://academic.oup.com/nar/article-pdf/49/D1/D480/35364011/gkaa1100.pdf', true, 'oup article-pdf'],
+  // Silverchair's watermark host: where OUP and ACS actually serve the file, reached by a
+  // signed handoff off the article page. Granting only the landing host left the tab
+  // following a redirect it could never satisfy, so it waited out its whole budget.
+  ['https://watermark02.silverchair.com/gkaa1100.pdf?token=AQECAHi208BE49O', true, 'oup watermark handoff'],
 
   // accepted: DigitalCommons, only on a listed host AND a bepress path
   ['https://digitalcommons.unl.edu/cgi/viewcontent.cgi?article=1&context=x', true, 'bepress viewcontent'],
@@ -346,6 +350,7 @@ test('the allowlist is exactly the hosts we intend to grant', () => {
     'onlinelibrary.wiley.com',
     'pubs.acs.org',
     'academic.oup.com',
+    'silverchair.com',
   ]);
 });
 

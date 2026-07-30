@@ -142,23 +142,71 @@ function log(...parts) {
 }
 
 /**
- * The directory both sides of the bridge must agree on. Exported so the client
- * client derives it from this one definition instead of a copy that can drift.
+ * The logged-in user, as both sides of the bridge must compute it identically.
+ *
+ * SANITISED, because the name goes into an address. An Entra-joined Windows machine reports
+ * `AzureAD\jdoe` or a `user@tenant.com` UPN, and a backslash inside a pipe name silently
+ * creates a differently-shaped name -- legal to bind, and a trap the moment the two sides
+ * normalise it even slightly differently. Restricting to a conservative set makes the two
+ * derivations agree by construction rather than by luck.
  */
-export function socketDirFor() {
-  if (process.env.SSRN_BRIDGE_SOCKET_DIR) return process.env.SSRN_BRIDGE_SOCKET_DIR;
+function bridgeUser() {
   // userInfo().username rather than $USER: Chrome does not necessarily pass a
   // useful environment to the host it spawns.
   let user = 'unknown';
   try {
     user = os.userInfo().username;
   } catch {
-    // Fall through to the placeholder; the pid still makes the socket unique.
+    // The pid still makes the address unique; only the per-user split is lost.
   }
+  return String(user).replace(/[^A-Za-z0-9._-]/g, '_') || 'unknown';
+}
+
+/**
+ * The directory both sides of the bridge must agree on. Exported so the client
+ * derives it from this one definition instead of a copy that can drift.
+ *
+ * WINDOWS HAS NO SUCH DIRECTORY. There are no Unix domain sockets there, so the
+ * bridge uses a named pipe instead and there is nothing to scan -- see
+ * socketAddressFor. This still answers, because the code that sweeps stale files
+ * and chmods the directory is skipped on win32 rather than branched everywhere.
+ */
+export function socketDirFor() {
+  if (process.env.SSRN_BRIDGE_SOCKET_DIR) return process.env.SSRN_BRIDGE_SOCKET_DIR;
   // Literal /tmp, not os.tmpdir(): that honours TMPDIR, and Chrome's
   // environment is not the client's. The socket has to live at an address
   // both sides can derive independently.
-  return path.join('/tmp', `ssrn-bridge-${user}`);
+  return path.join('/tmp', `ssrn-bridge-${bridgeUser()}`);
+}
+
+/**
+ * The ONE address a host listens on, for every platform.
+ *
+ * Unix: a per-pid file in socketDirFor(), so several hosts can coexist and the
+ * client picks the newest that answers.
+ *
+ * Windows: a NAMED PIPE. Windows has no Unix domain sockets, so `listen()` on a
+ * filesystem path fails outright -- the extension would install and register
+ * correctly and then never connect. A pipe name is not a file: it cannot be
+ * scanned for, unlinked, or chmod'ed, which is why those steps are skipped
+ * rather than emulated.
+ *
+ * The name is fixed rather than per-pid BECAUSE it cannot be discovered. Both
+ * sides have to derive the same address with no shared state, and a second host
+ * simply fails to bind -- which is the correct outcome: one host per user is all
+ * the bridge ever wanted, and the loser exits instead of listening somewhere
+ * nobody will look.
+ */
+export function socketAddressFor(pid = process.pid) {
+  if (process.platform === 'win32') {
+    return `\\\\.\\pipe\\ssrn-bridge-${bridgeUser()}`;
+  }
+  return path.join(socketDirFor(), `${pid}.sock`);
+}
+
+/** True when the address is a filesystem entry, and so has files to manage. */
+export function socketIsFile() {
+  return process.platform !== 'win32';
 }
 
 /**
@@ -198,15 +246,21 @@ function sweepStaleSockets(dir) {
 function main() {
   const requestTimeoutMs = Number(process.env.SSRN_BRIDGE_REQUEST_TIMEOUT_MS) || DEFAULT_REQUEST_TIMEOUT_MS;
   const socketDir = socketDirFor();
-  const socketPath = path.join(socketDir, `${process.pid}.sock`);
+  const socketPath = socketAddressFor();
 
-  // 0700 both on create and afterwards: mkdir honours the umask, so an
-  // inherited 022 would otherwise leave it group/world readable, and the socket
-  // is the trust boundary for "fetch as the logged-in user".
-  fs.mkdirSync(socketDir, { recursive: true, mode: 0o700 });
-  fs.chmodSync(socketDir, 0o700);
-  if (fs.existsSync(socketPath)) fs.unlinkSync(socketPath);
-  sweepStaleSockets(socketDir);
+  // Filesystem housekeeping, and only where the address IS a file. A Windows
+  // named pipe has no directory to create, no mode to tighten and no stale
+  // entries to sweep: the name disappears with the process that owns it, which
+  // is the property all of this exists to emulate on Unix.
+  if (socketIsFile()) {
+    // 0700 both on create and afterwards: mkdir honours the umask, so an
+    // inherited 022 would otherwise leave it group/world readable, and the socket
+    // is the trust boundary for "fetch as the logged-in user".
+    fs.mkdirSync(socketDir, { recursive: true, mode: 0o700 });
+    fs.chmodSync(socketDir, 0o700);
+    if (fs.existsSync(socketPath)) fs.unlinkSync(socketPath);
+    sweepStaleSockets(socketDir);
+  }
 
   /**
    * Pending requests keyed by the id THIS host minted for Chrome. Socket
@@ -651,6 +705,14 @@ function main() {
             pdfUrl: typeof parsed.pdfUrl === 'string' ? parsed.pdfUrl.slice(0, 2000) : undefined,
             email: typeof parsed.email === 'string' ? parsed.email.slice(0, 200) : undefined,
             coreApiKey: typeof parsed.coreApiKey === 'string' ? parsed.coreApiKey.slice(0, 200) : undefined,
+            // Which sources may run. Names only, capped and string-checked -- they select
+            // from a fixed ladder, they cannot introduce one.
+            only: Array.isArray(parsed.only)
+              ? parsed.only.filter((x) => typeof x === 'string').slice(0, 20).map((x) => x.slice(0, 40))
+              : undefined,
+            skip: Array.isArray(parsed.skip)
+              ? parsed.skip.filter((x) => typeof x === 'string').slice(0, 20).map((x) => x.slice(0, 40))
+              : undefined,
           });
           continue;
         }
@@ -769,6 +831,21 @@ function main() {
   });
 
   server.on('error', (err) => {
+    // A NAME ALREADY TAKEN is not a failure, it is a duplicate host losing a race.
+    //
+    // On Windows the pipe name is fixed per user, because a pipe name cannot be enumerated
+    // and both sides therefore have to derive the same one. So a second host must not linger:
+    // it would be listening at an address nobody looks at, while the winner serves the
+    // bridge. Exit 0 says "nothing to do here" rather than reporting a fault.
+    //
+    // Cannot fire on Unix, where the address carries the pid and is unlinked first -- so a
+    // genuine bind failure there (EACCES on the directory, ENOENT) still falls through to
+    // shutdown(1) and is reported.
+    if (err && err.code === 'EADDRINUSE') {
+      log('another host already owns this address; exiting');
+      shutdown(0, 'duplicate host');
+      return;
+    }
     log('socket server error:', err.message);
     shutdown(1);
   });
@@ -790,6 +867,9 @@ function main() {
   }
 
   function cleanupSocketPath() {
+    // A named pipe is not a file: it has no directory entry to remove, and the
+    // name is released by the OS when the owning process exits. Nothing to do.
+    if (!socketIsFile()) return;
     try {
       fs.unlinkSync(socketPath);
     } catch {
@@ -820,9 +900,14 @@ function main() {
   });
 
   server.listen(socketPath, () => {
-    fs.chmodSync(socketPath, 0o600);
+    // 0600 on the socket itself, not just its directory: the directory mode stops
+    // a lookup, the socket mode stops a connect. Skipped for a named pipe, which
+    // has no mode -- its ACL comes from the creating process, so it is already
+    // restricted to this user.
+    if (socketIsFile()) fs.chmodSync(socketPath, 0o600);
     log(`listening on ${socketPath}`);
   });
+
 
   process.stdin.resume();
 }

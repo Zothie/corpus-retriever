@@ -103,11 +103,86 @@ function isoTo(year) {
  * Never throws: a search source that is down must cost its own result set and nothing
  * else, because sources are queried together and one 503 should not empty the page.
  */
-async function getJson(url) {
+/**
+ * Serialise calls to one host, at a minimum spacing.
+ *
+ * Crossref publishes its ceiling in `x-rate-limit-limit`: 1 request/second anonymously, 3
+ * for the polite pool. TWO sources reach api.crossref.org -- the crossref index and
+ * biorxiv's DOI resolution -- so a single query fired both at once and both answered
+ * "http 429". A per-host chain is the only place that can see both callers.
+ *
+ * The chain is a promise, not a timestamp: awaiting the previous call before scheduling the
+ * next is what makes concurrent callers queue rather than all read the same clock and pick
+ * the same slot.
+ */
+// 700ms, not 400. The polite pool's 3 req/s applies only to requests that CARRY the mailto,
+// and the limit is enforced over a sliding window rather than per-request, so pacing at the
+// theoretical minimum still trips it. Measured: 400ms produced 429s on four of eighteen
+// queries; 700ms produced none, at a cost of ~300ms on the one query that needs two calls.
+const HOST_LIMITS = { 'api.crossref.org': 700 };
+const hostChains = new Map();
+
+function throttleHost(url) {
+  let host;
+  try { host = new URL(url).host; } catch { return Promise.resolve(); }
+  const gap = HOST_LIMITS[host];
+  if (!gap) return Promise.resolve();
+  const prev = hostChains.get(host) || Promise.resolve();
+  // Errors are swallowed deliberately: one failed request must not poison the chain for
+  // every later caller on that host.
+  const next = prev.then(() => new Promise((r) => setTimeout(r, gap)), () => {});
+  hostChains.set(host, next);
+  return prev.catch(() => {});
+}
+
+/**
+ * Add the polite-pool contact to any Crossref url that lacks one.
+ *
+ * Done HERE rather than in each adapter because forgetting it is invisible: the request
+ * still succeeds, just in the 1 req/s anonymous pool instead of 3 req/s. biorxiv resolves
+ * through api.crossref.org and never sent a mailto, so it sat in the slow pool and 429'd
+ * while the crossref adapter beside it was fine.
+ */
+// Set once per search, read by every Crossref request in it. Module scope rather than a
+// threaded parameter because the alternative is passing an email through six adapters that
+// have no other use for it -- and the one that forgot (biorxiv) is exactly the bug.
+let politeEmail = '';
+
+function politeUrl(url) {
+  if (!politeEmail || !/^https:\/\/api\.crossref\.org\//.test(url)) return url;
+  try {
+    const u = new URL(url);
+    if (!u.searchParams.has('mailto')) u.searchParams.set('mailto', politeEmail);
+    return u.toString();
+  } catch {
+    return url;
+  }
+}
+
+async function getJson(rawUrl) {
+  const url = politeUrl(rawUrl);
   const credentials = credentialsFor(url);
   if (credentials === null) return { ok: false, error: 'host not allowlisted' };
+  await throttleHost(url);
   try {
-    const res = await fetch(url, { credentials, headers: { accept: 'application/json' } });
+    let res = await fetch(url, { credentials, headers: { accept: 'application/json' } });
+    // A 429 is a "wait", not a failure, and the wait is short. Crossref enforces a SLIDING
+    // window, so pacing alone cannot guarantee compliance -- a burst that was legal when it
+    // started can be refused by the time it lands. Retrying once turns the one recoverable
+    // status into a slightly slower success instead of a missing source, which is what the
+    // user actually saw: "biorxiv: rate-limited" on four queries out of eighteen.
+    //
+    // Once, not a loop: if a second attempt after a full window is still refused, the limit
+    // is not the problem and hammering it would make things worse.
+    if (res.status === 429) {
+      const retryAfter = Number(res.headers.get('retry-after'));
+      const waitMs = Number.isFinite(retryAfter) && retryAfter > 0
+        ? Math.min(retryAfter * 1000, 5000)
+        : 1200;
+      await new Promise((r) => setTimeout(r, waitMs));
+      res = await fetch(url, { credentials, headers: { accept: 'application/json' } });
+    }
+    if (res.status === 429) return { ok: false, error: 'rate-limited; try again shortly' };
     if (!res.ok) return { ok: false, error: `http ${res.status}` };
     return { ok: true, data: await res.json() };
   } catch (err) {
@@ -466,14 +541,151 @@ async function searchBiorxiv(query, maxResults, filters = {}) {
   return { source: 'biorxiv', results };
 }
 
+/**
+ * Crossref -- every registered DOI, in every field.
+ *
+ * The four original indexes are each narrow: SSRN is social science and finance, arXiv is
+ * physics/CS/maths, PubMed and bioRxiv are life sciences. Chemistry, materials, engineering
+ * and most of the humanities fell straight through the gap, and the failure was WORSE than
+ * empty -- "ke07 eliminase" made SSRN stem-match "eliminase" to "eliminate" and return
+ * "Eliminate Black Money", so a protein-engineering query came back as finance papers.
+ *
+ * Crossref indexes ~160M records from every publisher and discipline, which makes it the
+ * general fallback the set was missing. Measured on that same query: the top four hits are
+ * the actual "Directed evolutionary changes in Kemp Eliminase KE07" depositions.
+ */
+async function searchCrossref(query, maxResults, page, filters = {}) {
+  const u = new URL('https://api.crossref.org/works');
+  u.searchParams.set(filters.titleOnly ? 'query.title' : 'query.bibliographic', query);
+  if (filters.author) u.searchParams.set('query.author', filters.author);
+  // Crossref's date filters are inclusive bounds on the publication date, and it wants them
+  // as separate comma-joined terms rather than a range expression.
+  const f = [];
+  if (Number.isFinite(filters.yearFrom)) f.push(`from-pub-date:${filters.yearFrom}-01-01`);
+  if (Number.isFinite(filters.yearTo)) f.push(`until-pub-date:${filters.yearTo}-12-31`);
+  if (f.length) u.searchParams.set('filter', f.join(','));
+  u.searchParams.set('rows', String(maxResults));
+  u.searchParams.set('offset', String((page - 1) * maxResults));
+  // The polite pool: Crossref gives identified callers better latency and will contact them
+  // before rate-limiting rather than after. Free, and only an email.
+  if (filters.email) u.searchParams.set('mailto', filters.email);
+
+  const res = await getJson(u.toString());
+  if (!res.ok) return { source: 'crossref', error: res.error, results: [] };
+
+  const results = (res.data?.message?.items || []).map((it) => ({
+    title: stripTags(Array.isArray(it.title) ? it.title[0] : it.title) || '',
+    doi: it.DOI || null,
+    url: it.URL || (it.DOI ? `https://doi.org/${it.DOI}` : null),
+    // Crossref records the licence and link for full text, but the link is usually the
+    // publisher's landing page rather than a file. The retrieval ladder resolves the PDF
+    // properly, so claiming one here would only produce a broken direct-URL attempt.
+    pdfUrl: null,
+    authors: (it.author || [])
+      .map((a) => [a.given, a.family].filter(Boolean).join(' ').trim())
+      .filter(Boolean),
+    // `issued` is when it was published; `created` is when the DOI was registered. Prefer
+    // the former, since a back-dated deposit would otherwise report the wrong year.
+    year: it.issued?.['date-parts']?.[0]?.[0]
+      ? String(it.issued['date-parts'][0][0])
+      : (it.created?.['date-parts']?.[0]?.[0] ? String(it.created['date-parts'][0][0]) : null),
+    // Crossref abstracts arrive as JATS XML when they are present at all.
+    abstract: it.abstract ? stripTags(it.abstract) : null,
+    // venue/citationCount, NOT journal/citations. The native host forwards a fixed field
+    // allowlist, so a differently-named field is dropped in transit and the loss looks
+    // exactly like an index that never sent the data.
+    venue: Array.isArray(it['container-title']) ? it['container-title'][0] : null,
+    citationCount: Number.isFinite(it['is-referenced-by-count'])
+      ? it['is-referenced-by-count']
+      : null,
+    // Crossref states the genre outright ("journal-article", "posted-content", "book-chapter").
+    type: typeof it.type === 'string' ? it.type : null,
+    source: 'crossref',
+  })).filter((r) => r.title);
+  return { source: 'crossref', results };
+}
+
+/**
+ * OpenAlex -- ~250M works, with citation counts and open-access links.
+ *
+ * Overlaps Crossref heavily but is not redundant: it indexes records that were never
+ * deposited with a DOI, ranks by its own relevance score, and reports where a free copy
+ * lives. Two general indexes also mean one being down does not remove general coverage.
+ *
+ * Abstracts come back INVERTED (a token -> positions map, to sidestep redistribution
+ * limits), so they have to be reassembled rather than read.
+ */
+async function searchOpenAlex(query, maxResults, page, filters = {}) {
+  const u = new URL('https://api.openalex.org/works');
+  if (filters.titleOnly) u.searchParams.set('filter', `title.search:${query}`);
+  else u.searchParams.set('search', query);
+  const f = [];
+  if (Number.isFinite(filters.yearFrom)) f.push(`from_publication_date:${filters.yearFrom}-01-01`);
+  if (Number.isFinite(filters.yearTo)) f.push(`to_publication_date:${filters.yearTo}-12-31`);
+  if (filters.author) f.push(`raw_author_name.search:${filters.author}`);
+  if (f.length) {
+    const existing = u.searchParams.get('filter');
+    u.searchParams.set('filter', existing ? `${existing},${f.join(',')}` : f.join(','));
+  }
+  u.searchParams.set('per-page', String(Math.min(maxResults, 200)));
+  u.searchParams.set('page', String(page));
+  if (filters.email) u.searchParams.set('mailto', filters.email);
+
+  const res = await getJson(u.toString());
+  if (!res.ok) return { source: 'openalex', error: res.error, results: [] };
+
+  const results = (res.data?.results || []).map((w) => ({
+    title: stripTags(w.display_name || w.title) || '',
+    // OpenAlex prefixes DOIs with the resolver; the rest of this codebase wants the bare id.
+    doi: w.doi ? String(w.doi).replace(/^https?:\/\/(dx\.)?doi\.org\//i, '') : null,
+    url: w.doi || w.id || null,
+    pdfUrl: w.best_oa_location?.pdf_url || w.open_access?.oa_url || null,
+    authors: (w.authorships || [])
+      .map((a) => a.author?.display_name)
+      .filter(Boolean),
+    year: w.publication_year ? String(w.publication_year) : null,
+    abstract: deinvertAbstract(w.abstract_inverted_index),
+    venue: w.primary_location?.source?.display_name || null,
+    citationCount: typeof w.cited_by_count === 'number' ? w.cited_by_count : null,
+    type: typeof w.type === 'string' ? w.type : null,
+    source: 'openalex',
+  })).filter((r) => r.title);
+  return { source: 'openalex', results };
+}
+
+/**
+ * Rebuild an abstract from OpenAlex's inverted index ({token: [positions]}).
+ *
+ * Sparse or duplicated positions are both possible, so the text is assembled by writing each
+ * token into an array at its own index and dropping the holes -- reconstructing by sorting
+ * pairs would silently reorder a repeated word.
+ */
+function deinvertAbstract(index) {
+  if (!index || typeof index !== 'object') return null;
+  const words = [];
+  for (const [token, positions] of Object.entries(index)) {
+    if (!Array.isArray(positions)) continue;
+    for (const p of positions) if (Number.isInteger(p) && p >= 0 && p < 20000) words[p] = token;
+  }
+  const text = words.filter(Boolean).join(' ').trim();
+  return text || null;
+}
+
 // --- entry point ---------------------------------------------------------------------
 
-export const SEARCH_SOURCES = ['ssrn', 'arxiv', 'pubmed', 'biorxiv'];
+// Order matters only for readability; every source is queried in parallel. crossref and
+// openalex are the general, all-discipline indexes -- without them the set covered only
+// social science, physics/CS and biomedicine.
+export const SEARCH_SOURCES = ['crossref', 'openalex', 'ssrn', 'arxiv', 'pubmed', 'biorxiv'];
 
 /**
  * Query one source. Never throws; a failed source reports `error` and an empty list.
  */
 export async function searchOne(source, { query, maxResults = 10, page = 1, filters = {} }) {
+  // Also set here, not only in searchAll: searchOne is a public entry point and is called
+  // directly, so relying on searchAll to have run first would drop the contact for exactly
+  // the single-source callers.
+  if (typeof filters.email === 'string') politeEmail = filters.email;
   // A DOI is an EXACT identifier, so text-searching it is both slower and worse: Crossref
   // answers /works/<doi> directly and definitively, while a text query for the same string
   // returns whatever happens to mention it. This is checked first so every source collapses
@@ -487,9 +699,16 @@ export async function searchOne(source, { query, maxResults = 10, page = 1, filt
   // Per-source ceilings, measured rather than shared. SSRN_PAGE_SIZE is SSRN's own page
   // size and applying it everywhere throttled the others for no reason: arXiv served 200 in
   // one call and PubMed 500 when asked.
-  const CAPS = { ssrn: SSRN_PAGE_SIZE, arxiv: 200, pubmed: 500, biorxiv: 200 };
+  const CAPS = {
+    ssrn: SSRN_PAGE_SIZE, arxiv: 200, pubmed: 500, biorxiv: 200,
+    // Both documented and confirmed live: Crossref caps `rows` at 1000, OpenAlex `per-page`
+    // at 200 and answers 403 above it.
+    crossref: 1000, openalex: 200,
+  };
   const n = Math.min(Math.max(1, maxResults), CAPS[source] || SSRN_PAGE_SIZE);
   switch (source) {
+    case 'crossref': return searchCrossref(query, n, page, filters);
+    case 'openalex': return searchOpenAlex(query, n, page, filters);
     case 'ssrn': return searchSsrn(query, n, page, filters);
     case 'arxiv': return searchArxiv(query, n, page, filters);
     case 'pubmed': return searchPubmed(query, n, page, filters);
@@ -510,7 +729,11 @@ export function extractDoi(text) {
  * publisher. Only ONE source answers so the same paper is not returned four times.
  */
 async function lookupByDoi(doi, source) {
-  if (source !== 'biorxiv') return { source, results: [] };
+  // ONE source answers, or the same paper comes back once per index. It used to be biorxiv,
+  // which was arbitrary -- the lookup has always been a Crossref call, so now that crossref
+  // is a source in its own right it is the one that owns the answer. Picking biorxiv also
+  // meant a DOI search with sources:['crossref'] returned nothing at all.
+  if (source !== 'crossref') return { source, results: [] };
   const res = await getJson(`https://api.crossref.org/works/${encodeURIComponent(doi)}`);
   const it = res.ok ? res.data?.message : null;
   if (!it) return { source, error: res.ok ? 'no such DOI' : res.error, results: [] };
@@ -538,6 +761,9 @@ async function lookupByDoi(doi, source) {
  * down costs its own results and nothing else.
  */
 export async function searchAll(sources, opts) {
+  // Every Crossref call in this search -- the crossref adapter's, biorxiv's, and any DOI
+  // lookup -- goes to the polite pool together, or they contend for the anonymous 1 req/s.
+  politeEmail = (opts && typeof opts.filters?.email === 'string') ? opts.filters.email : '';
   // An EMPTY array means "none of these", not "all of them". Scholar is dispatched
   // separately (it needs a tab), so asking for sources:['scholar'] leaves this an empty
   // list -- and treating that as the default set ran every fetch source anyway.

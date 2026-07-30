@@ -175,9 +175,14 @@ export const PUBLISHERS = [
     pdfUrl: () => null,
     manualLabel: 'Mendeley Data dataset page',
     headed: false,
+    // STALE as of 2026-07-30: data.mendeley.com now answers "Dataset Not Found" for
+    // hxfhg7ycpr, so a run against these samples fails on the FIXTURE rather than on the
+    // resolver -- which reads as a broken source and cost a round of investigation. Kept
+    // rather than deleted because they are what the header's measurements were taken
+    // against; replace them the next time this path is verified live.
     samples: [
-      { doi: '10.17632/hxfhg7ycpr.1', url: null },
-      { doi: null, url: 'https://data.mendeley.com/datasets/hxfhg7ycpr/1' },
+      { doi: '10.17632/hxfhg7ycpr.1', url: null, stale: 'dataset removed upstream' },
+      { doi: null, url: 'https://data.mendeley.com/datasets/hxfhg7ycpr/1', stale: 'dataset removed upstream' },
     ],
   },
   {
@@ -385,9 +390,16 @@ export const PUBLISHERS = [
     // An OUP article page links its supplementary material as .pdf too, and those satisfy
     // the shape rules and the %PDF- check just as well as the full text does. Without this
     // the first link wins and a supplement gets filed as the paper, which is worse than a
-    // failed download because nothing downstream can detect it. Both observed full-text
-    // path shapes ("/article-pdf/" and "/advance-article-pdf/") end in the same token.
-    preferPdfLink: /\/(advance-)?article-pdf\//,
+    // failed download because nothing downstream can detect it.
+    //
+    // THREE shapes, all observed. The first two are paths on academic.oup.com itself; the
+    // third is the signed handoff to Silverchair's watermark host, measured 2026-07-30:
+    //   .../article-pdf/49/D1/D1/...
+    //   .../advance-article-pdf/doi/...
+    //   https://watermark02.silverchair.com/gkaa1100.pdf?token=AQECAHi208BE49O...
+    // The handoff is what a browser actually follows, and matching only the first two left
+    // the page's real link on the floor while the tab sat open to its budget.
+    preferPdfLink: /\/(advance-)?article-pdf\/|watermark\d*\.silverchair\.com\/.+\.pdf/,
     manualLabel: 'OUP article page',
     headed: false,
     // Each sample carries the article URL as well as the DOI because extractId is
