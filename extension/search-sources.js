@@ -834,26 +834,22 @@ async function searchEuropePmc(query, maxResults, page, filters = {}) {
 /**
  * Semantic Scholar -- ~220M papers, with the citation graph and OA links.
  *
- * KEY-GATED, and that is not a preference. Unauthenticated calls answer 429: measured on
- * three consecutive spaced attempts, with no header and with an empty X-API-KEY, every one
- * refused. The shared anonymous pool is saturated in practice, so a keyless request is not
- * "slower", it simply never succeeds.
+ * The key is OPTIONAL by policy and effectively required in practice, which is why this
+ * tries anyway rather than refusing up front.
  *
- * Without a key the source reports that fact rather than an error. A source that says "429"
- * on every search reads as broken; one that says it needs a key tells the user what to do,
- * and the free key is a form on Semantic Scholar's site.
+ * Semantic Scholar documents the unauthenticated tier as 1000 requests per second SHARED
+ * ACROSS ALL ANONYMOUS USERS, "further throttled during periods of heavy use". That shared
+ * pool is saturated: measured 0 successes in 10 attempts spaced 6 seconds apart, and again
+ * with an empty X-API-KEY header. So anonymous access is real but rarely available, and the
+ * honest thing is to attempt it and report what actually happened.
  *
- * What it adds that the others do not: `citationCount` and `influentialCitationCount` for
- * ranking, `openAccessPdf` as a direct file link, and `tldr`, its one-line summary.
+ * A key raises the caller to their own 1 RPS, which is slower per-request than the shared
+ * ceiling and vastly more reliable, because nobody else is spending it.
+ *
+ * What it adds that the others do not: `citationCount` for ranking, and `openAccessPdf` as a
+ * verified direct file link.
  */
 async function searchSemanticScholar(query, maxResults, page, filters = {}) {
-  if (!filters.semanticScholarKey) {
-    return {
-      source: 'semanticscholar',
-      error: 'needs a free API key (semanticscholar.org/product/api)',
-      results: [],
-    };
-  }
   const u = new URL('https://api.semanticscholar.org/graph/v1/paper/search');
   u.searchParams.set('query', query);
   u.searchParams.set('limit', String(Math.min(maxResults, 100)));
@@ -870,14 +866,25 @@ async function searchSemanticScholar(query, maxResults, page, filters = {}) {
 
   const credentials = credentialsFor(u.toString());
   if (credentials === null) return { source: 'semanticscholar', error: 'host not allowlisted', results: [] };
+  const headers = { accept: 'application/json' };
+  // Sent only when present. An EMPTY X-API-KEY is not the same as none -- it was measured
+  // being refused just as an anonymous request is, so an empty string must not be forwarded.
+  if (filters.semanticScholarKey) headers['X-API-KEY'] = filters.semanticScholarKey;
   let data;
   try {
-    const res = await fetch(u.toString(), {
-      credentials,
-      headers: { accept: 'application/json', 'X-API-KEY': filters.semanticScholarKey },
-    });
+    const res = await fetch(u.toString(), { credentials, headers });
     if (res.status === 429) {
-      return { source: 'semanticscholar', error: 'rate-limited; try again shortly', results: [] };
+      // Two different situations behind one status, and the difference is what the reader
+      // can DO about it. Without a key they are queueing behind every anonymous caller in
+      // the world; with one, they have simply gone too fast.
+      return {
+        source: 'semanticscholar',
+        error: filters.semanticScholarKey
+          ? 'rate-limited; try again shortly'
+          : 'the shared anonymous quota is exhausted -- a free API key '
+            + '(semanticscholar.org/product/api) gives you your own',
+        results: [],
+      };
     }
     if (res.status === 401 || res.status === 403) {
       return { source: 'semanticscholar', error: 'the API key was rejected', results: [] };
@@ -916,12 +923,24 @@ async function searchSemanticScholar(query, maxResults, page, filters = {}) {
 // Order matters only for readability; every source is queried in parallel. crossref and
 // openalex are the general, all-discipline indexes -- without them the set covered only
 // social science, physics/CS and biomedicine.
-// semanticscholar is LAST and needs a free API key. It is listed anyway so it appears in the
-// UI as a source the user can switch on; without a key it reports that, rather than failing.
 export const SEARCH_SOURCES = [
   'crossref', 'openalex', 'europepmc', 'ssrn', 'arxiv', 'pubmed', 'biorxiv',
-  'semanticscholar',
 ];
+
+/**
+ * Sources that EXIST but are not queried by default.
+ *
+ * semanticscholar is here because it does not currently answer. Its anonymous quota is
+ * shared across every unauthenticated caller and is exhausted in practice -- measured 0
+ * successes in 10 attempts spaced 6 seconds apart. Listing it in SEARCH_SOURCES meant every
+ * search carried a row that could only ever report a failure, which reads as a broken
+ * product rather than an unavailable optional extra.
+ *
+ * The adapter is kept and still works: `searchOne('semanticscholar', ...)` runs, and an
+ * explicit `sources: ['semanticscholar']` still reaches it. When a key is configured it
+ * becomes worth switching on, which is why this is a list rather than a deletion.
+ */
+export const OPTIONAL_SEARCH_SOURCES = ['semanticscholar'];
 
 /**
  * Query one source. Never throws; a failed source reports `error` and an empty list.
@@ -1018,7 +1037,11 @@ export async function searchAll(sources, opts) {
   // An EMPTY array means "none of these", not "all of them". Scholar is dispatched
   // separately (it needs a tab), so asking for sources:['scholar'] leaves this an empty
   // list -- and treating that as the default set ran every fetch source anyway.
-  const list = (Array.isArray(sources) ? sources : SEARCH_SOURCES)
-    .filter((s) => SEARCH_SOURCES.includes(s));
+  // The default set is SEARCH_SOURCES, but an EXPLICIT request may also name an optional
+  // source. Filtering both lists against SEARCH_SOURCES alone would silently drop
+  // sources:['semanticscholar'] and answer with an empty array, which is indistinguishable
+  // from a search that found nothing.
+  const known = [...SEARCH_SOURCES, ...OPTIONAL_SEARCH_SOURCES];
+  const list = (Array.isArray(sources) ? sources.filter((s) => known.includes(s)) : SEARCH_SOURCES);
   return Promise.all(list.map((s) => searchOne(s, opts)));
 }
