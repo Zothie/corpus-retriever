@@ -69,7 +69,7 @@ const MAX_LINK_CHARS = 2048;
  * apart in `pending` by req.kind so a reply of the wrong shape for an id can
  * never be folded into the other one's state machine.
  */
-const REQUEST_KINDS = new Set(['pdf', 'links', 'reload', 'search', 'retrieve', 'download']);
+const REQUEST_KINDS = new Set(['pdf', 'links', 'reload', 'search', 'retrieve', 'download', 'devlog']);
 
 /**
  * True when both are parseable URLs with the same scheme, host and port. Used to
@@ -250,6 +250,10 @@ function main() {
     // buffering would be an unbounded memory sink keyed by attacker choice.
     if (!req) return;
 
+    if (msg.type === 'devlog_result') {
+      finish(hostId, { ok: true, report: msg.report });
+      return;
+    }
     if (msg.type === 'reload_extension_result') {
       finish(hostId, { ok: msg.ok === true });
       return;
@@ -300,6 +304,21 @@ function main() {
             })) }
             : undefined,
         );
+        return;
+      }
+      // A file Chrome saved ITSELF carries no bytes, and that is a success, not an empty
+      // failure. Some hosts answer a navigation with a Content-Disposition, so the browser
+      // takes the response over and writes the file directly -- measured, a 2.8 MB paper
+      // landed correctly in Downloads while this line reported "carried no pdf" and the
+      // caller retried, which is where the duplicate copies came from.
+      if (msg.savedByBrowser === true) {
+        finish(hostId, {
+          ok: true,
+          savedByBrowser: true,
+          filename: typeof msg.filename === 'string' ? msg.filename.slice(0, 200) : null,
+          bytes: Number.isFinite(msg.bytes) ? msg.bytes : null,
+          source: typeof msg.source === 'string' ? msg.source.slice(0, 40) : 'unknown',
+        });
         return;
       }
       if (typeof msg.base64 !== 'string' || !msg.base64) {
@@ -353,6 +372,7 @@ function main() {
             // omission here is indistinguishable from an index not sending the data.
             venue: typeof r.venue === 'string' ? r.venue.slice(0, 300) : null,
             citationCount: Number.isFinite(r.citationCount) ? r.citationCount : null,
+            type: typeof r.type === 'string' ? r.type.slice(0, 60) : null,
             source: typeof r.source === 'string' ? r.source.slice(0, 40) : 'unknown',
           }))
           : [],
@@ -563,6 +583,24 @@ function main() {
         // reload restarts the extension so a code change takes effect. It names no
         // resource, so it skips the url checks below -- and it can reach nothing: the
         // extension's handler ignores any payload and only calls chrome.runtime.reload().
+        // The retrieval trace, read back from the worker. Same plumbing as reload: register a
+        // pending id, ack, and let the extension's reply resolve it.
+        if (kind === 'devlog') {
+          if (socketState.pending.size >= MAX_PENDING_PER_CLIENT || pending.size >= MAX_PENDING_TOTAL) {
+            reply({ id: clientId, ok: false, error: 'too many requests in flight' });
+            continue;
+          }
+          const hostId = crypto.randomUUID();
+          const timer = setTimeout(() => fail(hostId, 'timed out'), requestTimeoutMs);
+          if (typeof timer.unref === 'function') timer.unref();
+          pending.set(hostId, {
+            clientId, socket, socketState, kind, chunks: null, parts: null, timer,
+          });
+          socketState.pending.add(hostId);
+          reply({ id: clientId, ack: true });
+          sendToChrome({ type: 'devlog', id: hostId });
+          continue;
+        }
         if (kind === 'reload') {
           // Shed load here too. Skipping it let a local process queue unlimited reloads
           // and keep the extension permanently restarting, which is the one denial of

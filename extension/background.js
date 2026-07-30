@@ -102,6 +102,20 @@ const OA_TAB_BUDGET_MS = 20 * 1000;
 // Two minutes is long enough for a person who IS looking at a challenge to answer it, and
 // short enough that a paper nobody is watching fails rather than hanging forever.
 const PUBLISHER_BUDGET_MS = 120 * 1000;
+// How long a DDoS-Guard interstitial is given to clear itself.
+//
+// It is infrastructure protection rather than a reader-facing gate, and a browser normally
+// rides through it unaided -- so the right response is to wait rather than to skip the host
+// or bother the user. But it does not always resolve: measured on one mirror, the page
+// changed once at ~17s and then stayed put for 167s without reaching the article. 45s is
+// well past the transition a working one makes, and short enough that a stuck one leaves
+// time for the other mirrors.
+const DDOS_GUARD_WAIT_MS = 45 * 1000;
+// Longer, once __ddg1_ is set: the host has decided in our favour and the page is expected
+// to follow, usually on the next request. Measured on a COLD profile the interstitial never
+// resolved at all, which is why the no-cookie budget above stays short -- a visitor it has
+// not cleared is not one it is about to.
+const DDOS_GUARD_CLEARED_WAIT_MS = 90 * 1000;
 const RECONNECT_ALARM = 'corpus-retriever-reconnect';
 // Fires while the bridge is HEALTHY, so an evicted worker is revived. See connect().
 const HEARTBEAT_ALARM = 'corpus-retriever-heartbeat';
@@ -737,15 +751,9 @@ function inPageSolveAltcha() {
   if (!widget) return 'no-widget';
   const cu = widget.getAttribute('challengeurl');
   if (!cu) return 'no-challengeurl';
-  const idm = /\/captcha\/challenge\/(\d+)/.exec(cu);
-  if (!idm) return 'no-id';
 
   return (async () => {
     try {
-      // No credentials literal: both requests are RELATIVE, so they are same-origin, and
-      // fetch already sends the page's own cookies for those by default. Naming a value here
-      // would put the choice back at the call site -- the shape that once let cookies reach
-      // hosts with no business seeing them, and which a structural test forbids.
       const ch = await (await fetch(cu)).json();
       if (!ch || ch.algorithm !== 'SHA-256') return 'bad-challenge';
       const enc = new TextEncoder();
@@ -764,18 +772,75 @@ function inPageSolveAltcha() {
         salt: ch.salt,
         signature: ch.signature,
       }));
-      const post = await fetch(`/captcha/solution/${idm[1]}`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ captcha: payload }),
-      });
-      if (!post.ok) return `http-${post.status}`;
-      const v = await post.json();
-      return v && v.success ? 'solved' : 'rejected';
+
+      // TWO VARIANTS, and they differ in who submits the answer.
+      //
+      // A) challengeurl carries a numeric id (/captcha/challenge/12345). The page POSTs the
+      //    payload to /captcha/solution/<id> itself as JSON {captcha: <base64>}. Note that
+      //    is NOT the form-encoded `altcha=` the ALTCHA docs describe -- the documented
+      //    shape returns 200 with {"success":false}.
+      const idm = /\/captcha\/challenge\/(\d+)/.exec(cu);
+      if (idm) {
+        const post = await fetch(`/captcha/solution/${idm[1]}`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ captcha: payload }),
+        });
+        if (!post.ok) return `http-${post.status}`;
+        const v = await post.json();
+        return v && v.success ? 'solved' : 'rejected';
+      }
+
+      // B) No id: the page posts NOTHING on its own. It stashes the payload, hides the
+      //    widget and reveals a submit button for a human to press -- measured on a mirror
+      //    serving `challengeurl="/captcha/challenge"`. Answering it therefore means driving
+      //    the page's own form rather than calling an endpoint, because there is no endpoint
+      //    to call. The widget is asked to verify, then the revealed button is clicked.
+      const form = widget.closest('form') || document.querySelector('dialog.problem form, form');
+      if (typeof widget.verify === 'function') {
+        widget.verify();
+      } else {
+        widget.dispatchEvent(new CustomEvent('statechange', {
+          detail: { state: 'verified', payload },
+        }));
+      }
+      // Give the page a moment to accept the payload and reveal its control.
+      for (let i = 0; i < 40; i += 1) {
+        const btn = document.querySelector('dialog.problem .submit button, form button[type="submit"]');
+        if (btn && btn.offsetParent !== null) { btn.click(); return 'submitted'; }
+        await new Promise((r) => setTimeout(r, 100));
+      }
+      if (form && typeof form.requestSubmit === 'function') { form.requestSubmit(); return 'submitted'; }
+      return 'no-submit-control';
     } catch (err) {
       return `threw-${err.name}`;
     }
   })();
+}
+
+/**
+ * What this page looks like right now, in the terms every decision here turns on.
+ *
+ * Injected into the tab so a trace can answer "what was actually on screen" without anyone
+ * re-fetching the url later and hoping it looks the same. It does not: Sci-Hub alternates
+ * between a challenge and the article for one url, so evidence gathered afterwards is
+ * evidence about a different page.
+ */
+function inPageSnapshot() {
+  const html = document.documentElement ? document.documentElement.outerHTML : '';
+  return {
+    title: (document.title || '').slice(0, 60),
+    ready: document.readyState,
+    bytes: html.length,
+    anchors: document.querySelectorAll('a[href]').length,
+    pdfLinks: (html.match(/\/storage\/[^"']*\.pdf|href="[^"]*\.pdf/gi) || []).length,
+    altcha: !!document.querySelector('altcha-widget'),
+    altchaOpen: !!document.querySelector('altcha-widget[challengeurl]'),
+    ddos: /ddos-guard/i.test(document.title),
+    cookies: (document.cookie || '').split(';').map((c) => c.trim().split('=')[0])
+      .filter(Boolean).slice(0, 8),
+    url: location.href.slice(0, 110),
+  };
 }
 
 function inPageSettled() {
@@ -864,6 +929,25 @@ function pageIsCleared(expectedOrigin) {
   const t = document.title || '';
   if (/just a moment|attention required|verifying|are you a robot|enable javascript and cookies/i.test(t)) return 'challenge:cf-title';
   if (document.querySelector('#challenge-form, #cf-challenge-running, .cf-browser-verification')) return 'challenge:cf';
+  // DDoS-Guard's interstitial. NOT a challenge for the reader -- it is infrastructure
+  // protection that clears ITSELF after a few seconds by running its own JS and redirecting.
+  // There is nothing a human can do about it and nothing for us to solve; the only correct
+  // response is to keep waiting, which is exactly what a browser does unaided.
+  //
+  // Detected by the <title> and by DDoS-Guard's own DOM, never by a substring of the whole
+  // body: `ddos-guard` can appear in a header or an inlined script path on a page that
+  // rendered perfectly well, and a marker present on GOOD pages silently loses papers the
+  // mirror actually has. That is exactly how keying on altcha.min.js broke.
+  if (/^\s*ddos-guard/i.test(document.title)
+      || document.querySelector('#ddg-captcha, .ddg-captcha, [id^="ddos-guard"]')) {
+    // Report whether the clearance cookie has landed yet. __ddg1_ is what DDoS-Guard sets
+    // once a visitor is through, and it is the difference between "still deciding" and
+    // "decided but the page has not moved". Read from document.cookie rather than through
+    // chrome.cookies so the extension needs no `cookies` permission for it.
+    return /__ddg1_|__ddgid_/.test(document.cookie)
+      ? 'challenge:ddos-guard-cleared'
+      : 'challenge:ddos-guard';
+  }
   // ALTCHA, reported separately from the Cloudflare family because it is the one challenge
   // the extension can answer itself -- see the inPageSolveAltcha branch in waitForTabCleared.
   // The widget alone is not enough: sci-hub loads it on article pages too, so this asks
@@ -962,6 +1046,11 @@ function waitForTabCleared(tabId, deadline, expectedOrigin, opts = {}) {
     // One attempt per wait. A second solve on the same page means the first was not the
     // reason it is stuck, and re-solving would spin instead of surfacing to a human.
     let altchaTried = false;
+    // When this tab first showed a DDoS-Guard interstitial, so the wait for it can be bounded
+    // separately from the caller's overall budget.
+    let ddosGuardSince = null;
+    // One reload, spent when the clearance cookie first appears.
+    let ddosReloaded = false;
     let scriptingRefusedSince = null;
     const poll = async () => {
       if (Date.now() > deadline) return resolve({ cleared: false, reason, surfaced });
@@ -996,7 +1085,9 @@ function waitForTabCleared(tabId, deadline, expectedOrigin, opts = {}) {
                 target: { tabId }, func: inPageSolveAltcha,
               });
               devMark('altcha', { result: sr && sr.result });
-              // Solved: the page needs to be re-requested for the article to render.
+              // 'solved' posted the answer itself and the article renders on a re-request.
+              // 'submitted' clicked the page's own form, which navigates on its own -- so
+              // reloading would race that navigation and could re-challenge the tab.
               if (sr && sr.result === 'solved') await chrome.tabs.reload(tabId);
             } catch {
               // Tab navigating or gone; the ordinary polling below handles it.
@@ -1042,7 +1133,41 @@ function waitForTabCleared(tabId, deadline, expectedOrigin, opts = {}) {
         }
       }
       const now = Date.now();
-      const wantsHuman = typeof reason === 'string' && reason.startsWith('challenge:');
+      // A human is wanted for a challenge only a human can pass. DDoS-Guard is not one:
+      // there is no puzzle on it, so surfacing the tab would put a page in front of the user
+      // that they can only watch. It is waited on instead -- but BOUNDED, because it does
+      // not reliably resolve. Measured 2026-07-30 on one mirror: the interstitial changed
+      // once at ~17s and then sat unchanged for 167 seconds without ever reaching the
+      // article. Waiting past that spends a mirror phase on a host that has already decided.
+      const wantsHuman = typeof reason === 'string'
+        && reason.startsWith('challenge:')
+        && reason !== 'challenge:ddos-guard';
+      if (reason === 'challenge:ddos-guard' || reason === 'challenge:ddos-guard-cleared') {
+        if (ddosGuardSince === null) ddosGuardSince = now;
+        // TWO conditions, and the cookie alone is not one of them. DDoS-Guard sets __ddg1_
+        // as soon as it has made up its mind, but the interstitial can still be on screen --
+        // so a cookie-only test would hand the caller a page with no article on it. The page
+        // moving off the interstitial is what actually ends the wait; the cookie only says
+        // the wait is worth continuing.
+        //
+        // Once the cookie exists it is allowed considerably longer, because the next reload
+        // is the one that usually carries the article. Without it, this host has not decided
+        // in our favour and the other mirrors are still waiting.
+        const budget = reason === 'challenge:ddos-guard-cleared'
+          ? DDOS_GUARD_CLEARED_WAIT_MS
+          : DDOS_GUARD_WAIT_MS;
+        if (now - ddosGuardSince > budget) {
+          return resolve({ cleared: false, reason: `${reason}-timeout`, surfaced });
+        }
+        // Nudge it once the cookie is in hand: the interstitial often only yields on a fresh
+        // request, and reloading with the clearance cookie attached is what a person does.
+        if (reason === 'challenge:ddos-guard-cleared' && !ddosReloaded) {
+          ddosReloaded = true;
+          try { await chrome.tabs.reload(tabId); } catch { /* tab gone */ }
+        }
+      } else {
+        ddosGuardSince = null;
+      }
       if (!surfaced && ((wantsHuman && now > autoClearUntil) || now > surfaceAt)) {
         surfaced = true;
         try { await chrome.tabs.update(tabId, { active: true }); } catch { /* tab gone */ }
@@ -1234,7 +1359,17 @@ async function withClearedTab(landing, body, budgetMs = HUMAN_SOLVE_BUDGET_MS) {
     // session. That is the leak. The hour-long budget still outlasts any real captcha and
     // both peers' timeouts, and it guarantees cleanup.
     const deadline = Date.now() + budgetMs;
+    try {
+      const [s0] = await chrome.scripting.executeScript({ target: { tabId }, func: inPageSnapshot });
+      devSnap('tab:opened', s0 && s0.result);
+    } catch { /* not scriptable yet; the wait below reports what it finds */ }
     const clear = await waitForTabCleared(tabId, deadline, expectedOrigin);
+    try {
+      const [s1] = await chrome.scripting.executeScript({ target: { tabId }, func: inPageSnapshot });
+      devSnap('tab:settled', { ...(s1 && s1.result), clearedAs: clear.reason });
+    } catch {
+      devSnap('tab:settled', { gone: true, clearedAs: clear.reason });
+    }
     // A non-scriptable document is a CLEARED tab, not a failed one. It means the landing url
     // was itself a PDF, so Chrome handed the tab to its internal viewer, which no extension
     // may script -- pageIsCleared can never answer for it and waiting longer cannot help.
@@ -1576,8 +1711,16 @@ async function fetchPdf({ url, referer, budgetMs }) {
   //
   // `strays` is the set of downloads Chrome began while this call was navigating, so it is
   // the evidence: a tab that disappeared with one in flight disappeared FOR it.
+  if (!out.ok && /tab-gone/.test(out.error || '')) {
+    devDecide('tab-gone', strays.size > 0 ? 'rescue' : 'give-up',
+      strays.size > 0 ? 'a download was in flight' : 'no download was started',
+      { strays: strays.size, error: String(out.error).slice(0, 60) });
+  }
   if (!out.ok && /tab-gone/.test(out.error || '') && strays.size > 0) {
     const saved = await waitForStrayDownload(strays);
+    devDecide('tab-gone', saved ? 'saved' : 'lost',
+      saved ? 'the download completed' : 'the download never completed',
+      saved ? { bytes: saved.bytes, filename: saved.filename } : { strays: strays.size });
     if (saved) {
       devMark('tab:became-download', { url, bytes: saved.bytes });
       // Claimed, so the finally below must not erase it as an unwanted stray.
@@ -2070,8 +2213,13 @@ async function retrievePaper({ doi, pdfUrl, email, coreApiKey }) {
     }
   }
   devStart('phase:openaccess');
+  for (const c of cheap) devMark('oa:candidate', { source: c.source, url: c.url });
   const raced = await Promise.all(cheap.map(async (c) => {
     const r = await fetchValidatedPdf(c.url);
+    devHttp(`oa:${c.source}`, {
+      url: c.url, bytes: r.ok ? r.buf.byteLength : undefined,
+      magic: r.ok ? '%PDF-' : undefined, error: r.ok ? undefined : r.error,
+    });
     if (!r.ok) attempts.push({ source: c.source, error: r.error });
     // Carry the failure with the CANDIDATE. Looking it up in `attempts` afterwards matched
     // whichever entry that source pushed first -- PMC's "not a pdf" masked the refusals the
@@ -2174,7 +2322,13 @@ async function retrievePaper({ doi, pdfUrl, email, coreApiKey }) {
           const page = scihubArticleUrl(host, doi);
           let body = await getTextMirror(page, PROBE_TIMEOUT_MS_MIRROR);
           // Host down, or rate-limiting: try the next one, still without a tab.
-          if (body === null) continue;
+          if (body === null) {
+            devDecide(`scihub:${host}`, 'skip', 'no answer', { error: lastMirrorError });
+            continue;
+          }
+          devHttp(`scihub:${host}`, {
+            url: page, status: 200, bytes: body.length, magic: body.slice(0, 24),
+          });
           // Skip ONLY on a definitive "not in my database" answer.
           //
           // The test is deliberately NOT "did the static html contain a pdf link". The whole
@@ -2183,16 +2337,34 @@ async function retrievePaper({ doi, pdfUrl, email, coreApiKey }) {
           // on it would silently lose papers Sci-Hub actually has -- a worse bug than the
           // stray tab this probe is here to prevent. Only the not-found page is conclusive,
           // because for it no link will EVER render, whatever the JS does.
-          if (isScihubUnavailableHtml(body)) continue;
+          if (isScihubUnavailableHtml(body)) {
+            devDecide(`scihub:${host}`, 'absent', 'not-in-database page', { bytes: body.length });
+            continue;
+          }
           // A captcha or DDoS interstitial is not an article page, and opening it spends the
           // user's attention on a robot check for a paper this mirror may not even hold.
           // Measured: sci-hub.ru served the same "proverka na robota" page for a real doi and
           // an invented one, so the page carries no information about the paper at all.
-          if (isMirrorChallengeHtml(body)) continue;
+          if (isMirrorChallengeHtml(body)) {
+            devDecide(`scihub:${host}`, 'skip', 'challenge page', {
+              bytes: body.length, title: (/<title>([^<]*)/i.exec(body) || [])[1],
+            });
+            continue;
+          }
           // The POSITIVE test, and the one that actually decides. A tab exists here only to
           // run the page's JS and resolve the file url, so it is worth opening only when the
           // page already shows a file to resolve. The robot check shows none.
-          if (!scihubPageOffersPdf(body)) continue;
+          // A DDoS-Guard interstitial earns a tab rather than a skip: the worker cannot run
+          // the JS that clears it, so what it fetched is not what a browser would see. Only
+          // a tab can find out whether the host actually holds the paper.
+          if (!scihubPageOffersPdf(body) && !isDdosGuardHtml(body)) {
+            devDecide(`scihub:${host}`, 'skip', 'no pdf offered', {
+              bytes: body.length, title: (/<title>([^<]*)/i.exec(body) || [])[1],
+              hasAltcha: /altcha-widget/.test(body),
+            });
+            continue;
+          }
+          devDecide(`scihub:${host}`, 'open-tab', 'page offers a file', { bytes: body.length });
           // The tab inherits what is LEFT of the phase, not fetchLinks' one-hour default.
           // That default is there so a human can solve a publisher captcha; no human is
           // waiting on a mirror, and inheriting it let one host hold a tab open long after
@@ -2654,6 +2826,13 @@ function connect() {
     // chrome://extensions. chrome.runtime.reload() restarts THIS extension only -- the
     // browser, its windows and every other extension are untouched. The port drops as a
     // result, which the host reads as a disconnect and the reconnect logic handles.
+    // The trace travels WITH the answer. A failure that has to be re-run to be understood is
+    // one that changed underneath you before you looked -- these hosts alternate between a
+    // challenge and the article for the same url, so a second run is a different experiment.
+    if (msg.type === 'devlog') {
+      port.postMessage({ type: 'devlog_result', id: msg.id, ok: true, report: devReport() });
+      return;
+    }
     if (msg.type === 'reload_extension') {
       try {
         port.postMessage({ type: 'reload_extension_result', id: msg.id, ok: true });
@@ -2826,70 +3005,158 @@ try {
 // cycles once. chrome-extension/search-sources.js remains the editable copy and is what the
 // tests import; tests/search-parity.test.mjs asserts the two stay identical.
 
-// Timing and tracing for the worker, off by default.
+// The retrieval trace: what happened, what the page looked like, and WHY each decision went
+// the way it did.
 //
-// WHY THIS EXISTS. Every investigation so far has meant writing a throwaway harness to bolt
-// timers onto the ladder, because the worker's 13 console calls carry no timings and no
-// phase boundaries. That is how a 66-second download was reported as "works": the parts all
-// passed and nobody could see where the seconds went. With this on, one run said probe=759ms
-// / retrieve=58s and the real problem was obvious immediately.
+// WHY THIS EXISTS, and why it is ON by default.
 //
-// OFF BY DEFAULT, and the check is a plain boolean read, so a disabled call costs one branch.
-// Turn it on from the worker console or a test:
+// Every investigation of this extension so far has been a guess dressed up as a diagnosis.
+// A download reported "no sci-hub mirror served it" and the only way to learn what the page
+// actually contained was to re-fetch it by hand, minutes later, in a different profile, and
+// hope it looked the same. It usually did not: Sci-Hub alternates between a challenge and
+// the article for the same url, so the evidence was gone by the time anyone looked. Wrong
+// conclusions followed -- "upstream throttling" that was really a test timeout, a captcha
+// marker that also appears on good pages, a duplicate file blamed on double-downloading.
 //
-//   chrome.storage.session.set({ devlog: true })   // survives worker eviction
-//   devlog.enabled = true                          // this worker only, immediate
+// So the rule this file enforces is: NEVER RECONSTRUCT, RECORD. Every fetch records its
+// status, size and the markers that were tested. Every tab records what the page looked like
+// when it was opened, while it was waited on, and when it was given up. Every skip records
+// the test that caused it. Reading one trace should answer "why did this fail" without
+// running anything.
 //
-// Deliberately NOT wired to a build flag: the bug that matters is usually in the user's own
-// browser with the shipped build, and asking them to reinstall a debug build to reproduce it
-// is how a report goes cold.
+// Cost is a few hundred small objects per download, capped. That is cheaper than one wrong
+// diagnosis.
+//
+// Read it from the worker console:
+//   devDump()                      the whole trace, formatted
+//   devReport()                    the raw events
+//   devlog.enabled = false         turn it off for this worker
 
 const devlog = {
-  enabled: false,
-  // Marks for the retrieval in progress, so a whole download reads as one table rather than
-  // interleaved lines. Keyed by nothing: one retrieval at a time is the normal case, and a
-  // second concurrent one simply appends -- its label carries the doi.
-  marks: [],
+  enabled: true,
+  events: [],
   t0: 0,
+  // Ring buffer. A stuck retrieval polls a page every few hundred ms for a minute, so an
+  // uncapped log would grow without bound in a worker that may live for hours.
+  max: 800,
 };
+
+function push(ev) {
+  if (!devlog.enabled) return;
+  if (!devlog.t0) devlog.t0 = Date.now();
+  ev.at = Date.now() - devlog.t0;
+  devlog.events.push(ev);
+  if (devlog.events.length > devlog.max) devlog.events.splice(0, devlog.events.length - devlog.max);
+}
 
 /** Start a timed span. Returns the label so callers can pass it straight to `devEnd`. */
 function devStart(label) {
-  if (!devlog.enabled) return label;
-  if (!devlog.t0) devlog.t0 = Date.now();
-  devlog.marks.push({ label, at: Date.now() - devlog.t0, phase: 'start' });
+  push({ kind: 'start', label });
   return label;
 }
 
 /** Close a span opened with `devStart`, recording how long it took. */
 function devEnd(label, detail) {
   if (!devlog.enabled) return;
-  const started = [...devlog.marks].reverse().find((m) => m.label === label && m.phase === 'start');
+  const started = [...devlog.events].reverse().find((e) => e.label === label && e.kind === 'start');
   const at = Date.now() - devlog.t0;
-  devlog.marks.push({
-    label, at, phase: 'end', ms: started ? at - started.at : null, detail,
-  });
-  const ms = started ? `${at - started.at}ms` : '?';
-  console.log(`[devlog] ${label} ${ms}${detail ? ` ${JSON.stringify(detail)}` : ''}`);
+  push({ kind: 'end', label, ms: started ? at - started.at : null, detail });
 }
 
-/** A point event -- a decision taken, a source skipped, a tab opened. */
+/** A point event: a decision taken, a source skipped, a tab opened. */
 function devMark(label, detail) {
-  if (!devlog.enabled) return;
-  if (!devlog.t0) devlog.t0 = Date.now();
-  const at = Date.now() - devlog.t0;
-  devlog.marks.push({ label, at, phase: 'mark', detail });
-  console.log(`[devlog] ${label} @${at}ms${detail ? ` ${JSON.stringify(detail)}` : ''}`);
+  push({ kind: 'mark', label, detail });
 }
 
-/** Everything recorded since the last reset, for a test or the console to read back. */
+/**
+ * A DECISION, with the evidence that drove it.
+ *
+ * This is the one that ends arguments. `verdict` is what was decided, `because` is the test
+ * that decided it, and `evidence` is the values that test saw. A skip recorded without its
+ * evidence is indistinguishable from a source that was never tried -- which is precisely
+ * what made several of these bugs so expensive to find.
+ */
+function devDecide(label, verdict, because, evidence) {
+  push({ kind: 'decide', label, verdict, because, evidence });
+}
+
+/**
+ * What came back from the network, before anything interpreted it.
+ *
+ * Records the shape of the response rather than its body: status, byte count, the first few
+ * bytes, and the content type. Enough to tell a PDF from a challenge page from an html
+ * error, which is the distinction every one of these bugs turned on.
+ */
+function devHttp(label, { url, status, bytes, magic, contentType, finalUrl, error }) {
+  push({
+    kind: 'http',
+    label,
+    detail: {
+      url: short(url),
+      status,
+      bytes,
+      magic,
+      contentType,
+      // Only when it differs -- a redirect is the whole story on some hosts and noise on the
+      // rest.
+      redirectedTo: finalUrl && finalUrl !== url ? short(finalUrl) : undefined,
+      error,
+    },
+  });
+}
+
+/** A page's state at a moment, as captured by inPageSnapshot in the tab. */
+function devSnap(label, snap) {
+  push({ kind: 'snap', label, detail: snap });
+}
+
+function short(u) {
+  if (typeof u !== 'string') return u;
+  return u.length > 110 ? `${u.slice(0, 107)}...` : u;
+}
+
+/** Everything recorded, for a test or the console to read back. */
 function devReport() {
-  return { totalMs: devlog.t0 ? Date.now() - devlog.t0 : 0, marks: devlog.marks };
+  return { totalMs: devlog.t0 ? Date.now() - devlog.t0 : 0, events: devlog.events };
 }
 
 function devReset() {
-  devlog.marks = [];
+  devlog.events = [];
   devlog.t0 = 0;
+}
+
+/**
+ * The trace as one readable table.
+ *
+ * Formatted rather than raw because the point is to be read at a glance. A decision line
+ * carries its verdict and the evidence on the same row, so "why did it skip this" never
+ * requires cross-referencing two other lines.
+ */
+function devDump() {
+  const rows = devlog.events.map((e) => {
+    const t = `${(e.at / 1000).toFixed(2)}s`.padStart(8);
+    if (e.kind === 'decide') {
+      const ev = e.evidence ? ` ${JSON.stringify(e.evidence)}` : '';
+      return `${t}  ${e.label.padEnd(22)} ${String(e.verdict).toUpperCase().padEnd(9)} ${e.because}${ev}`;
+    }
+    if (e.kind === 'http') {
+      const d = e.detail;
+      const red = d.redirectedTo ? ` -> ${d.redirectedTo}` : '';
+      const err = d.error ? ` ERROR ${d.error}` : '';
+      return `${t}  ${e.label.padEnd(22)} http=${String(d.status ?? '-').padEnd(4)} `
+        + `${String(d.bytes ?? '-').padStart(8)}B ${JSON.stringify(d.magic ?? '')} ${d.url}${red}${err}`;
+    }
+    if (e.kind === 'snap') {
+      const d = e.detail || {};
+      return `${t}  ${e.label.padEnd(22)} PAGE  ${JSON.stringify(d)}`;
+    }
+    if (e.kind === 'end') {
+      return `${t}  ${e.label.padEnd(22)} ${`${e.ms}ms`.padEnd(9)} ${e.detail ? JSON.stringify(e.detail) : ''}`;
+    }
+    if (e.kind === 'start') return `${t}  ${e.label.padEnd(22)} ...`;
+    return `${t}  ${e.label.padEnd(22)} ${e.detail ? JSON.stringify(e.detail) : ''}`;
+  });
+  return rows.join('\n');
 }
 
 // Every source returns this shape, so a caller never branches on which database answered.
@@ -2904,10 +3171,31 @@ function devReset() {
  * @property {string[]} authors
  * @property {string|null} year
  * @property {string|null} abstract
+ * @property {string|null} type         what KIND of document, when the index states one
  * @property {string} source            which database answered
  */
 
 const SSRN_PAGE_SIZE = 50;
+
+/**
+ * Reduce PubMed's `pubtype` array to the ONE qualifier worth reporting.
+ *
+ * esummary sends e.g. ["Journal Article", "Review"] or ["Randomized Controlled Trial",
+ * "Journal Article"]. Nearly everything PubMed indexes is also a "Journal Article", so that
+ * entry carries no information; the first entry that is NOT it is the answer, and a record
+ * that is only a journal article answers 'journal-article'.
+ *
+ * Nothing is guessed. A record with no `pubtype` yields null and the consumer says nothing
+ * about it -- a type inferred from a title or a journal name would be a claim the index
+ * never made.
+ */
+function pubmedType(pubtype) {
+  if (!Array.isArray(pubtype)) return null;
+  const kinds = pubtype.filter((t) => typeof t === 'string' && t.trim());
+  if (kinds.length === 0) return null;
+  const qualifier = kinds.find((t) => t.trim().toLowerCase() !== 'journal article');
+  return (qualifier || kinds[0]).trim().toLowerCase().replace(/\s+/g, '-');
+}
 
 /**
  * A search's filters. Every field is optional; an absent one is not sent upstream.
@@ -3058,6 +3346,10 @@ async function searchSsrn(query, maxResults, page, filters = {}) {
     // popularity signal it sends and is NOT a citation count, so it is deliberately not
     // mapped to one -- a download total shown as citations would misrepresent the paper.
     venue: null,
+    // Everything on SSRN is a working paper -- that is what the repository IS, not a guess
+    // about any individual row -- and that is exactly the fact a reader wants, because it
+    // says the paper has not been through peer review.
+    type: 'working-paper',
     citationCount: null,
     // SSRN sends NO `abstract` field -- measured, 0 of 50 rows have the key while 50 of 50
     // have `snippets`, an array of <em>-marked excerpts matching the query. Reading
@@ -3127,6 +3419,10 @@ async function searchArxiv(query, maxResults, page, filters = {}) {
       pdfUrl: absId ? `https://arxiv.org/pdf/${absId}` : null,
       // Present once a preprint has appeared somewhere; absent while it is only on arXiv.
       venue: xmlText(e, 'arxiv:journal_ref'),
+      // arXiv is a preprint server, so every row it returns is a preprint. Where
+      // `journal_ref` is present the paper has ALSO appeared in a venue, but the copy this
+      // hit points at is still the preprint, which is what the reader is being offered.
+      type: 'preprint',
       citationCount: null,
       authors: (e.match(/<name>([^<]*)<\/name>/g) || [])
         .map((n) => n.replace(/<\/?name>/g, '').trim())
@@ -3189,6 +3485,8 @@ async function searchPubmed(query, maxResults, page, filters = {}) {
       // fields for both: fulljournalname e.g. "Frontiers in plant science", pmcrefcount the
       // PMC citation count.
       venue: r.fulljournalname || r.source || null,
+      // esummary states the publication type in `pubtype`; pubmedType picks the qualifier.
+      type: pubmedType(r.pubtype),
       citationCount: Number.isFinite(r.pmcrefcount) ? r.pmcrefcount : null,
       authors: (r.authors || []).map((a) => a.name).filter(Boolean),
       // PubMed carries THREE dates -- pubdate (print), epubdate (electronic) and
@@ -3276,6 +3574,10 @@ async function searchBiorxiv(query, maxResults, filters = {}) {
         ? String(it.issued['date-parts'][0][0])
         : null,
       venue: it['group-title'] || (it.institution || [])[0]?.name || null,
+      // This query asks Crossref for type=posted-content and keeps only 10.1101, so every
+      // row IS a preprint. Crossref's own `type` is reported when it says something more
+      // specific than that, and never invented when it does not.
+      type: typeof it.type === 'string' && it.type !== 'posted-content' ? it.type : 'preprint',
       citationCount: Number.isFinite(it['is-referenced-by-count'])
         ? it['is-referenced-by-count']
         : null,
@@ -3959,6 +4261,24 @@ function isScihubUnavailableHtml(html) {
  * that a publisher is known to hold the paper, while a mirror serving a captcha has told us
  * nothing at all -- so spending the user's attention on it buys nothing.
  */
+/**
+ * Is this DDoS-Guard's interstitial?
+ *
+ * Kept apart from isMirrorChallengeHtml on purpose. A challenge there means "skip this
+ * host"; this means the opposite -- open a tab, because the interstitial clears itself by
+ * running JS the worker cannot, and what the worker fetched is not what a browser sees.
+ *
+ * Narrow by design. `ddos-guard` as a substring of the whole body would also match a header
+ * or a script path on a page that rendered fine, and a marker that fires on GOOD pages
+ * silently loses papers the mirror has -- the way keying on altcha.min.js did.
+ */
+function isDdosGuardHtml(html) {
+  if (typeof html !== 'string' || !html) return false;
+  const head = html.slice(0, 4096);
+  return /<title>\s*ddos-guard/i.test(head)
+    || /id=["']?ddg-captcha|class=["'][^"']*ddg-captcha/i.test(head);
+}
+
 function isMirrorChallengeHtml(html) {
   if (typeof html !== 'string' || !html) return false;
   // Only the head of the document: a challenge page is small and says what it is at once,

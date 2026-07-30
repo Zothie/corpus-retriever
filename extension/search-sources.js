@@ -48,10 +48,31 @@ import { credentialsFor } from './allowlist.js';
  * @property {string[]} authors
  * @property {string|null} year
  * @property {string|null} abstract
+ * @property {string|null} type         what KIND of document, when the index states one
  * @property {string} source            which database answered
  */
 
 const SSRN_PAGE_SIZE = 50;
+
+/**
+ * Reduce PubMed's `pubtype` array to the ONE qualifier worth reporting.
+ *
+ * esummary sends e.g. ["Journal Article", "Review"] or ["Randomized Controlled Trial",
+ * "Journal Article"]. Nearly everything PubMed indexes is also a "Journal Article", so that
+ * entry carries no information; the first entry that is NOT it is the answer, and a record
+ * that is only a journal article answers 'journal-article'.
+ *
+ * Nothing is guessed. A record with no `pubtype` yields null and the consumer says nothing
+ * about it -- a type inferred from a title or a journal name would be a claim the index
+ * never made.
+ */
+function pubmedType(pubtype) {
+  if (!Array.isArray(pubtype)) return null;
+  const kinds = pubtype.filter((t) => typeof t === 'string' && t.trim());
+  if (kinds.length === 0) return null;
+  const qualifier = kinds.find((t) => t.trim().toLowerCase() !== 'journal article');
+  return (qualifier || kinds[0]).trim().toLowerCase().replace(/\s+/g, '-');
+}
 
 /**
  * A search's filters. Every field is optional; an absent one is not sent upstream.
@@ -202,6 +223,10 @@ async function searchSsrn(query, maxResults, page, filters = {}) {
     // popularity signal it sends and is NOT a citation count, so it is deliberately not
     // mapped to one -- a download total shown as citations would misrepresent the paper.
     venue: null,
+    // Everything on SSRN is a working paper -- that is what the repository IS, not a guess
+    // about any individual row -- and that is exactly the fact a reader wants, because it
+    // says the paper has not been through peer review.
+    type: 'working-paper',
     citationCount: null,
     // SSRN sends NO `abstract` field -- measured, 0 of 50 rows have the key while 50 of 50
     // have `snippets`, an array of <em>-marked excerpts matching the query. Reading
@@ -271,6 +296,10 @@ async function searchArxiv(query, maxResults, page, filters = {}) {
       pdfUrl: absId ? `https://arxiv.org/pdf/${absId}` : null,
       // Present once a preprint has appeared somewhere; absent while it is only on arXiv.
       venue: xmlText(e, 'arxiv:journal_ref'),
+      // arXiv is a preprint server, so every row it returns is a preprint. Where
+      // `journal_ref` is present the paper has ALSO appeared in a venue, but the copy this
+      // hit points at is still the preprint, which is what the reader is being offered.
+      type: 'preprint',
       citationCount: null,
       authors: (e.match(/<name>([^<]*)<\/name>/g) || [])
         .map((n) => n.replace(/<\/?name>/g, '').trim())
@@ -333,6 +362,8 @@ async function searchPubmed(query, maxResults, page, filters = {}) {
       // fields for both: fulljournalname e.g. "Frontiers in plant science", pmcrefcount the
       // PMC citation count.
       venue: r.fulljournalname || r.source || null,
+      // esummary states the publication type in `pubtype`; pubmedType picks the qualifier.
+      type: pubmedType(r.pubtype),
       citationCount: Number.isFinite(r.pmcrefcount) ? r.pmcrefcount : null,
       authors: (r.authors || []).map((a) => a.name).filter(Boolean),
       // PubMed carries THREE dates -- pubdate (print), epubdate (electronic) and
@@ -420,6 +451,10 @@ async function searchBiorxiv(query, maxResults, filters = {}) {
         ? String(it.issued['date-parts'][0][0])
         : null,
       venue: it['group-title'] || (it.institution || [])[0]?.name || null,
+      // This query asks Crossref for type=posted-content and keeps only 10.1101, so every
+      // row IS a preprint. Crossref's own `type` is reported when it says something more
+      // specific than that, and never invented when it does not.
+      type: typeof it.type === 'string' && it.type !== 'posted-content' ? it.type : 'preprint',
       citationCount: Number.isFinite(it['is-referenced-by-count'])
         ? it['is-referenced-by-count']
         : null,
