@@ -4334,12 +4334,187 @@ function deinvertAbstract(index) {
   return text || null;
 }
 
+/**
+ * The document GENRE from Europe PMC's pubType list, ignoring the indexing noise.
+ *
+ * The list mixes three unrelated things: what the document is ("review-article"), how
+ * MEDLINE indexed it ("IM"), and who paid for it ("Research-Support, Non-U.S. Gov't"). Only
+ * the first is a genre, and the other two reached the UI as types until this existed.
+ *
+ * A record whose list contains nothing but noise yields null, which the consumer renders as
+ * saying nothing -- better than confidently reporting a funding note as a document kind.
+ */
+// Matched against the RAW string, before any normalising. The first version of this ran
+// after a lowercase-and-hyphenate pass and so tested `research-support`, while the API
+// actually sends "Research Support, Non-U.S. Gov't" -- with a SPACE. Every funding note
+// slipped through, and the rows were typed "research-support,-non-u.s.-gov't".
+const EPMC_NON_GENRE = /^(im|in-process|publisher|research[ -]support|epublish|ppublish)/i;
+
+function europePmcType(pubType) {
+  if (!Array.isArray(pubType)) return null;
+  const kinds = pubType
+    .filter((t) => typeof t === 'string' && t.trim() && !EPMC_NON_GENRE.test(t.trim()));
+  if (kinds.length === 0) return null;
+  // "Journal Article" and "research-article" are both true of nearly everything here, so a
+  // more specific sibling wins over either.
+  const generic = new Set(['journal article', 'research-article', 'research article']);
+  const specific = kinds.find((t) => !generic.has(t.trim().toLowerCase()));
+  return (specific || kinds[0]).trim().toLowerCase().replace(/\s+/g, '-');
+}
+
+/**
+ * Europe PMC -- life sciences, and NOT a duplicate of PubMed.
+ *
+ * That was the thing worth checking before adding it, since both index biomedicine and a
+ * source that only repeats another costs a request and buys nothing. Measured by comparing
+ * DOIs on the same query: 13 of Europe PMC's 25 hits for "ke07 eliminase" were absent from
+ * PubMed's, and 21 of 24 for "perovskite solar cell stability". It indexes preprints,
+ * European and agricultural literature, and patents that PubMed does not carry.
+ *
+ * No key and no registration, unlike Semantic Scholar, which answered 429 on three
+ * consecutive unauthenticated attempts and was rejected for that reason.
+ */
+async function searchEuropePmc(query, maxResults, page, filters = {}) {
+  const u = new URL('https://www.ebi.ac.uk/europepmc/webservices/rest/search');
+  // Europe PMC has its own field syntax: TITLE, AUTH, PUB_YEAR, all ANDed.
+  const terms = [filters.titleOnly ? `TITLE:"${query.replace(/"/g, ' ')}"` : query];
+  if (filters.author) terms.push(`AUTH:"${String(filters.author).replace(/"/g, ' ')}"`);
+  if (Number.isFinite(filters.yearFrom) || Number.isFinite(filters.yearTo)) {
+    terms.push(`PUB_YEAR:[${filters.yearFrom || 1800} TO ${filters.yearTo || 2100}]`);
+  }
+  u.searchParams.set('query', terms.join(' AND '));
+  u.searchParams.set('format', 'json');
+  u.searchParams.set('pageSize', String(Math.min(maxResults, 100)));
+  u.searchParams.set('page', String(page));
+  // `core` rather than the default: the lite response omits the abstract and the journal,
+  // which are two of the fields the studio actually stores.
+  u.searchParams.set('resultType', 'core');
+
+  const res = await getJson(u.toString());
+  if (!res.ok) return { source: 'europepmc', error: res.error, results: [] };
+
+  const results = (res.data?.resultList?.result || []).map((r) => ({
+    title: stripTags(r.title) || '',
+    doi: r.doi || null,
+    // A PMID link is stable and resolves for anyone; the EPMC id is not as widely known.
+    url: r.pmid
+      ? `https://pubmed.ncbi.nlm.nih.gov/${r.pmid}/`
+      : (r.doi ? `https://doi.org/${r.doi}` : null),
+    // Only claim a PDF when the record says one exists AND is open. `hasPDF` alone is true
+    // for paywalled entries, and offering a link that 403s is worse than offering none.
+    pdfUrl: r.isOpenAccess === 'Y' && r.pmcid
+      ? `https://europepmc.org/articles/${r.pmcid}?pdf=render`
+      : null,
+    authors: (r.authorList?.author || [])
+      .map((a) => a.fullName || [a.firstName, a.lastName].filter(Boolean).join(' ').trim())
+      .filter(Boolean),
+    year: r.pubYear ? String(r.pubYear) : null,
+    abstract: r.abstractText ? stripTags(r.abstractText) : null,
+    venue: r.journalInfo?.journal?.title || null,
+    citationCount: Number.isFinite(r.citedByCount) ? r.citedByCount : null,
+    // pubTypeList mixes real genres with MEDLINE indexing tags, and pubmedType alone let the
+    // tags through: rows came back typed "im" (an indexing status) and
+    // "research-support,-non-u.s.-gov't" (a funding note). Neither says what the document
+    // IS, which is the only thing this field is for.
+    type: europePmcType(r.pubTypeList?.pubType),
+    // `source` here is EPMC's own archive code -- PPR means the row IS a preprint, which is
+    // the one distinction a reader needs and would otherwise be lost.
+    source: r.source === 'PPR' ? 'preprint' : 'europepmc',
+  })).filter((r) => r.title);
+  return { source: 'europepmc', results };
+}
+
+/**
+ * Semantic Scholar -- ~220M papers, with the citation graph and OA links.
+ *
+ * KEY-GATED, and that is not a preference. Unauthenticated calls answer 429: measured on
+ * three consecutive spaced attempts, with no header and with an empty X-API-KEY, every one
+ * refused. The shared anonymous pool is saturated in practice, so a keyless request is not
+ * "slower", it simply never succeeds.
+ *
+ * Without a key the source reports that fact rather than an error. A source that says "429"
+ * on every search reads as broken; one that says it needs a key tells the user what to do,
+ * and the free key is a form on Semantic Scholar's site.
+ *
+ * What it adds that the others do not: `citationCount` and `influentialCitationCount` for
+ * ranking, `openAccessPdf` as a direct file link, and `tldr`, its one-line summary.
+ */
+async function searchSemanticScholar(query, maxResults, page, filters = {}) {
+  if (!filters.semanticScholarKey) {
+    return {
+      source: 'semanticscholar',
+      error: 'needs a free API key (semanticscholar.org/product/api)',
+      results: [],
+    };
+  }
+  const u = new URL('https://api.semanticscholar.org/graph/v1/paper/search');
+  u.searchParams.set('query', query);
+  u.searchParams.set('limit', String(Math.min(maxResults, 100)));
+  // Offset paging, not page numbers.
+  u.searchParams.set('offset', String((page - 1) * maxResults));
+  if (Number.isFinite(filters.yearFrom) || Number.isFinite(filters.yearTo)) {
+    u.searchParams.set('year', `${filters.yearFrom || ''}-${filters.yearTo || ''}`);
+  }
+  // Fields must be requested explicitly; anything omitted is simply absent from the reply.
+  u.searchParams.set(
+    'fields',
+    'title,abstract,year,venue,citationCount,externalIds,openAccessPdf,publicationTypes,authors.name',
+  );
+
+  const credentials = credentialsFor(u.toString());
+  if (credentials === null) return { source: 'semanticscholar', error: 'host not allowlisted', results: [] };
+  let data;
+  try {
+    const res = await fetch(u.toString(), {
+      credentials,
+      headers: { accept: 'application/json', 'X-API-KEY': filters.semanticScholarKey },
+    });
+    if (res.status === 429) {
+      return { source: 'semanticscholar', error: 'rate-limited; try again shortly', results: [] };
+    }
+    if (res.status === 401 || res.status === 403) {
+      return { source: 'semanticscholar', error: 'the API key was rejected', results: [] };
+    }
+    if (!res.ok) return { source: 'semanticscholar', error: `http ${res.status}`, results: [] };
+    data = await res.json();
+  } catch (err) {
+    return { source: 'semanticscholar', error: `${err.name}: ${err.message}`, results: [] };
+  }
+
+  const results = (data?.data || []).map((p) => ({
+    title: stripTags(p.title) || '',
+    doi: p.externalIds?.DOI || null,
+    url: p.externalIds?.DOI
+      ? `https://doi.org/${p.externalIds.DOI}`
+      : (p.paperId ? `https://www.semanticscholar.org/paper/${p.paperId}` : null),
+    // Only present when S2 has verified an openly licensed copy, so it is safe to hand
+    // straight to the retrieval ladder.
+    pdfUrl: p.openAccessPdf?.url || null,
+    authors: (p.authors || []).map((a) => a.name).filter(Boolean),
+    year: p.year ? String(p.year) : null,
+    abstract: p.abstract ? stripTags(p.abstract) : null,
+    venue: p.venue || null,
+    citationCount: Number.isFinite(p.citationCount) ? p.citationCount : null,
+    type: Array.isArray(p.publicationTypes) && p.publicationTypes.length
+      ? String(p.publicationTypes[0]).toLowerCase().replace(/\s+/g, '-')
+      : null,
+    // An arXiv id with no DOI means the row IS the preprint, which is worth saying.
+    source: (!p.externalIds?.DOI && p.externalIds?.ArXiv) ? 'arXiv' : 'semanticscholar',
+  })).filter((r) => r.title);
+  return { source: 'semanticscholar', results };
+}
+
 // --- entry point ---------------------------------------------------------------------
 
 // Order matters only for readability; every source is queried in parallel. crossref and
 // openalex are the general, all-discipline indexes -- without them the set covered only
 // social science, physics/CS and biomedicine.
-const SEARCH_SOURCES = ['crossref', 'openalex', 'ssrn', 'arxiv', 'pubmed', 'biorxiv'];
+// semanticscholar is LAST and needs a free API key. It is listed anyway so it appears in the
+// UI as a source the user can switch on; without a key it reports that, rather than failing.
+const SEARCH_SOURCES = [
+  'crossref', 'openalex', 'europepmc', 'ssrn', 'arxiv', 'pubmed', 'biorxiv',
+  'semanticscholar',
+];
 
 /**
  * Query one source. Never throws; a failed source reports `error` and an empty list.
@@ -4367,11 +4542,17 @@ async function searchOne(source, { query, maxResults = 10, page = 1, filters = {
     // Both documented and confirmed live: Crossref caps `rows` at 1000, OpenAlex `per-page`
     // at 200 and answers 403 above it.
     crossref: 1000, openalex: 200,
+    // Europe PMC caps pageSize at 1000, but answers slowly past a few hundred.
+    europepmc: 100,
+    // S2 caps `limit` at 100 for the search endpoint.
+    semanticscholar: 100,
   };
   const n = Math.min(Math.max(1, maxResults), CAPS[source] || SSRN_PAGE_SIZE);
   switch (source) {
     case 'crossref': return searchCrossref(query, n, page, filters);
     case 'openalex': return searchOpenAlex(query, n, page, filters);
+    case 'europepmc': return searchEuropePmc(query, n, page, filters);
+    case 'semanticscholar': return searchSemanticScholar(query, n, page, filters);
     case 'ssrn': return searchSsrn(query, n, page, filters);
     case 'arxiv': return searchArxiv(query, n, page, filters);
     case 'pubmed': return searchPubmed(query, n, page, filters);
