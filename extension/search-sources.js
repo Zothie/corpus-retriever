@@ -542,6 +542,45 @@ async function searchBiorxiv(query, maxResults, filters = {}) {
 }
 
 /**
+ * Who actually hosts a record, from its DOI prefix.
+ *
+ * A DOI prefix is assigned to one registrant and never reused, which makes it the only
+ * identifier here that cannot lie. Crossref's own `institution` and `group-title` are
+ * populated inconsistently -- measured on one page of preprints, Research Square and bioRxiv
+ * filled them while chemRxiv left both null -- and `publisher` names the parent organisation
+ * rather than the venue ("American Chemical Society (ACS)" for a chemRxiv preprint).
+ *
+ * Only servers that a reader would recognise are listed. An unlisted prefix returns null and
+ * the caller falls back, because inventing a name from the publisher string would attribute
+ * a chemRxiv preprint to ACS.
+ */
+const DOI_PREFIX_HOST = {
+  '10.26434': 'chemRxiv',
+  '10.21203': 'Research Square',
+  '10.20944': 'Preprints.org',
+  '10.31234': 'PsyArXiv',
+  '10.31219': 'OSF Preprints',
+  '10.35542': 'EarthArXiv',
+  '10.1101': 'bioRxiv',
+  '10.48550': 'arXiv',
+  '10.2139': 'SSRN',
+  '10.31235': 'SocArXiv',
+  '10.31730': 'AfricArXiv',
+  '10.36227': 'TechRxiv',
+  '10.22541': 'Authorea',
+  '10.12688': 'F1000Research',
+  '10.7287': 'PeerJ Preprints',
+  '10.1590': 'SciELO',
+  '10.5281': 'Zenodo',
+  '10.31223': 'ESSOAr',
+};
+
+function recordHost(doi) {
+  if (typeof doi !== 'string') return null;
+  return DOI_PREFIX_HOST[doi.split('/')[0]] || null;
+}
+
+/**
  * Crossref -- every registered DOI, in every field.
  *
  * The four original indexes are each narrow: SSRN is social science and finance, arXiv is
@@ -563,7 +602,28 @@ async function searchCrossref(query, maxResults, page, filters = {}) {
   const f = [];
   if (Number.isFinite(filters.yearFrom)) f.push(`from-pub-date:${filters.yearFrom}-01-01`);
   if (Number.isFinite(filters.yearTo)) f.push(`until-pub-date:${filters.yearTo}-12-31`);
-  if (f.length) u.searchParams.set('filter', f.join(','));
+  // Ask for the kinds of record that are PAPERS, and say so positively.
+  //
+  // Crossref indexes far more than articles: figures, crystal structures and supplementary
+  // files each get their own DOI, as `component` and `dataset`. They outrank the papers that
+  // own them, because the query terms appear in a dozen near-identical deposit titles.
+  // Measured on "ke07 eliminase": ALL TWENTY top hits were crystal-structure deposits ("...
+  // KE07 - Crystal 1", "- Crystal 21", ...) and not one was a paper. Asking for the wanted
+  // types returns "Optimization of reorganization energy drives evolution of the Kemp
+  // eliminase KE07" as the first hit.
+  //
+  // Positively, because Crossref has no negative type filter -- `-type:component` is not
+  // rejected, it silently matches nothing, which is the worse failure.
+  //
+  // posted-content is in the list on purpose: it is how every preprint server deposits, so
+  // one filter reaches chemRxiv, Research Square, Preprints.org, PsyArXiv and SocArXiv
+  // together -- roughly 760k records that plain relevance ranking buries under published
+  // work.
+  f.push(
+    'type:journal-article', 'type:posted-content', 'type:proceedings-article',
+    'type:book-chapter', 'type:monograph', 'type:report', 'type:dissertation',
+  );
+  u.searchParams.set('filter', f.join(','));
   u.searchParams.set('rows', String(maxResults));
   u.searchParams.set('offset', String((page - 1) * maxResults));
   // The polite pool: Crossref gives identified callers better latency and will contact them
@@ -600,7 +660,14 @@ async function searchCrossref(query, maxResults, page, filters = {}) {
       : null,
     // Crossref states the genre outright ("journal-article", "posted-content", "book-chapter").
     type: typeof it.type === 'string' ? it.type : null,
-    source: 'crossref',
+    // Name the PREPRINT SERVER when the DOI says it is one, because "chemRxiv" tells a
+    // reader something "crossref" does not: that the paper has not been peer-reviewed.
+    //
+    // For everything else the source stays 'crossref'. The publisher was tried here and was
+    // wrong -- `venue` already carries the journal, so it produced rows sourced to
+    // "Elsevier" and "Oxford University PressOxford", which names a company rather than
+    // where the record was found and duplicates a field the reader already has.
+    source: recordHost(it.DOI) || 'crossref',
   })).filter((r) => r.title);
   return { source: 'crossref', results };
 }
@@ -648,7 +715,10 @@ async function searchOpenAlex(query, maxResults, page, filters = {}) {
     venue: w.primary_location?.source?.display_name || null,
     citationCount: typeof w.cited_by_count === 'number' ? w.cited_by_count : null,
     type: typeof w.type === 'string' ? w.type : null,
-    source: 'openalex',
+    // Same rule as crossref: name the preprint server, otherwise keep the index name.
+    source: recordHost(
+      w.doi ? String(w.doi).replace(/^https?:\/\/(dx\.)?doi\.org\//i, '') : null,
+    ) || 'openalex',
   })).filter((r) => r.title);
   return { source: 'openalex', results };
 }
