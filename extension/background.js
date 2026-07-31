@@ -7,6 +7,12 @@
 
 const NATIVE_HOST = 'com.repository.corpus_retriever';
 const MAX_PDF_BYTES = 80 * 1024 * 1024;
+// The floor under a "pdf". A header, one object, an xref table and a trailer cannot fit in
+// less, so anything smaller is a stub or an error page that happens to start with the magic
+// -- and saving one costs the user the paper, because a win ends the ladder and the sources
+// that held the real file are never asked. Measured: the smallest one-page pdf qpdf will
+// emit is a little over 600 bytes.
+const MIN_PDF_BYTES = 512;
 
 // Bounds for fetch_links. That capability reads hrefs out of a page the user's
 // cookies opened, so it is deliberately small: at most MAX_LINKS hrefs come back,
@@ -403,28 +409,56 @@ const TIER = {
  * tier from the URL inside the fetch primitive means a caller CANNOT choose, and adding a
  * host to the wrong list is the only way to get it wrong.
  *
- * Checked credentialed-first so a host on both lists gets the stronger grant, and so the
- * anonymous list can never quietly downgrade a publisher.
+ * THE MORE SPECIFIC GRANT WINS, and a tie goes to the credentialed one so the anonymous
+ * list can never quietly downgrade a publisher.
  */
 function urlTier(url) {
   if (typeof url !== 'string') return TIER.NONE;
-  // An EXACT entry in the anonymous list beats the credentialed SUFFIX grant.
+  // The MORE SPECIFIC entry decides, measured as the length of the matched suffix.
   //
   // api.ssrn.com is the case this exists for. ALLOWED_HOSTS grants 'ssrn.com' by suffix,
   // which would otherwise swallow api.ssrn.com and send the user's SSRN session to a
   // search API that neither needs nor should receive it. papers.ssrn.com is unaffected --
-  // it is not an exact entry here, so it keeps the credentialed grant it has always had.
+  // nothing in the anonymous list matches it at all, so it keeps its credentialed grant.
+  //
+  // Specificity rather than an EXACT-match test, which is what this used to be. An exact
+  // test answered only for api.ssrn.com itself: sub.api.ssrn.com matched no anonymous entry
+  // exactly, fell through to the 'ssrn.com' suffix, and came back CREDENTIALED -- the very
+  // leak the api.ssrn.com carve-out exists to prevent, one label further down. Comparing
+  // suffix lengths closes the whole subtree instead of one hostname.
+  //
+  // Verified against the current lists: no credentialed host sits under any anonymous entry,
+  // so nothing is downgraded by this.
+  let host;
   try {
-    const host = new URL(url).hostname.toLowerCase();
-    if (ANONYMOUS_HOSTS.includes(host)) {
-      // Still has to clear the structural checks below.
-      return anonymousTierFor(url);
-    }
+    host = new URL(url).hostname.toLowerCase();
   } catch {
     return TIER.NONE;
   }
+  const anonymous = grantSpecificity(host, ANONYMOUS_HOSTS);
+  // The path-constrained grant is EXACT-host, so it contributes its own length only when it
+  // is that exact host -- matching it as a suffix here would credit it for subdomains
+  // isAllowedUrl would refuse anyway.
+  const pathConstrained = PATH_CONSTRAINED_HOSTS.some((r) => r.host === host) ? host.length : -1;
+  const credentialed = Math.max(grantSpecificity(host, ALLOWED_HOSTS), pathConstrained);
+  // Still has to clear the structural checks inside anonymousTierFor.
+  if (anonymous > credentialed) return anonymousTierFor(url);
   if (isAllowedUrl(url)) return TIER.CREDENTIALED;
   return anonymousTierFor(url);
+}
+
+/**
+ * How specifically `list` grants `host`: the length of the longest entry that covers it,
+ * or -1 for no match. Only ever compared against another call's answer, so the unit is
+ * arbitrary as long as a longer suffix means a narrower grant -- which it does, since every
+ * entry is matched as "the host itself, or a subdomain of it".
+ */
+function grantSpecificity(host, list) {
+  let best = -1;
+  for (const h of list) {
+    if ((host === h || host.endsWith(`.${h}`)) && h.length > best) best = h.length;
+  }
+  return best;
 }
 
 /**
@@ -1381,11 +1415,24 @@ async function withClearedTab(landing, body, budgetMs = HUMAN_SOLVE_BUDGET_MS, n
   // these, so a tab that predates the call can never be adopted no matter what url it is
   // showing -- that is what keeps the sweep from being a url-pattern rule in disguise.
   const seen = new Set();
+  // Claiming is TWO registrations, never one. `owned` is what this call closes in its
+  // finally; tabsOwnedByAnyCall is what stops a CONCURRENT call adopting the same tab.
+  //
+  // Only the created tab used to reach the shared registry, so every ADOPTED tab -- exactly
+  // the target=_blank / rel=noopener handoffs this adoption logic exists for -- was invisible
+  // to other calls. Two calls for one url race routinely (save_to_vault does not serialise),
+  // and the second would re-adopt the first's live handoff tab by url, close it mid-fetch and
+  // then remove the same id twice. That is the same cross-call theft the registry was added
+  // to end, reachable through the adoption path instead of the creation path.
+  const claim = (id) => {
+    owned.add(id);
+    tabsOwnedByAnyCall.add(id);
+  };
   const adopt = (tab) => {
     if (!tab || typeof tab.id !== 'number') return;
     if (tabsOwnedByAnyCall.has(tab.id)) return;
     if (typeof tab.openerTabId === 'number' && owned.has(tab.openerTabId)) {
-      owned.add(tab.id);
+      claim(tab.id);
       return;
     }
     // URL adoption requires an OPENER, even though this fires only for new tabs.
@@ -1410,7 +1457,7 @@ async function withClearedTab(landing, body, budgetMs = HUMAN_SOLVE_BUDGET_MS, n
     }
     // pendingUrl is what a tab created for a navigation carries before it commits; url is
     // empty at that point, so both have to be checked or the match is always missed.
-    if (wasRequestedRecently(tab.pendingUrl) || wasRequestedRecently(tab.url)) owned.add(tab.id);
+    if (wasRequestedRecently(tab.pendingUrl) || wasRequestedRecently(tab.url)) claim(tab.id);
   };
   // A tab already owned that navigates to a url we asked for tells us nothing new, but a
   // tab created BEFORE its url was known (Chrome commits the navigation afterwards) does:
@@ -1435,7 +1482,7 @@ async function withClearedTab(landing, body, budgetMs = HUMAN_SOLVE_BUDGET_MS, n
     const byOpener = typeof tab?.openerTabId === 'number' && owned.has(tab.openerTabId);
     if (!byOpener && Date.now() - lastNavigationAt > HANDOFF_WINDOW_MS) return;
     const u = (info && info.url) || (tab && tab.url);
-    if (wasRequestedRecently(u)) owned.add(id);
+    if (wasRequestedRecently(u)) claim(id);
   };
   const note = (tab) => { if (tab && typeof tab.id === 'number') seen.add(tab.id); };
   // Registered before the create so a tab spawned during the first navigation is seen.
@@ -1449,8 +1496,7 @@ async function withClearedTab(landing, body, budgetMs = HUMAN_SOLVE_BUDGET_MS, n
     devMark('tab:open', { url: landing, budgetMs });
     const tab = await chrome.tabs.create({ url: landing, active: false });
     tabId = tab.id;
-    owned.add(tabId);
-    tabsOwnedByAnyCall.add(tabId);
+    claim(tabId);
     // The tab must actually be ON the target origin before it counts as cleared.
     let expectedOrigin = null;
     try { expectedOrigin = new URL(landing).origin; } catch { /* validated upstream */ }
@@ -2088,7 +2134,17 @@ const OUTAGE_KEY = 'sourceOutages';
 /** Failures that say the SOURCE is down, rather than that this paper is absent. */
 function isGlobalFailure(error) {
   if (typeof error !== 'string') return false;
-  return /no reachable|no mirror answered|budget exhausted|Failed to fetch|NetworkError|ERR_NAME_NOT_RESOLVED|getaddrinfo|ENOTFOUND|TimeoutError|AbortError/i.test(error);
+  // "budget exhausted" is NOT one of them, and used to be.
+  //
+  // It says the PHASE ran out of time, which is a statement about the ladder's clock and
+  // about the sources that ran EARLIER -- never about the health of the source it is
+  // recorded against. A source that never got to make a request is the one thing that
+  // cannot have been observed to be down. Parking on it was self-reinforcing in the worst
+  // way: a slow sci-hub spends the phase, libgen is skipped as "budget exhausted", libgen
+  // is parked for thirty minutes, and every download for the next half hour loses a healthy
+  // mirror that was never even asked. Measured against the reverse risk -- one wasted
+  // attempt per paper on a source that really is down -- and the wasted attempt is cheaper.
+  return /no reachable|no mirror answered|Failed to fetch|NetworkError|ERR_NAME_NOT_RESOLVED|getaddrinfo|ENOTFOUND|TimeoutError|AbortError/i.test(error);
 }
 
 /** Sources currently parked, as { name: expiryMs }. Never throws. */
@@ -2157,21 +2213,19 @@ async function paperTitle(doi) {
  * trusting the result.
  */
 function pdfFilename(title, doi, pdfUrl) {
-  const clean = (title || '')
-    // Path separators and the characters Windows forbids.
-    .replace(/[\\/:*?"<>|]/g, ' ')
-    // Control characters, which are legal on Linux and a trap everywhere else.
-    // eslint-disable-next-line no-control-regex
-    .replace(/[\x00-\x1f]/g, ' ')
-    .replace(/\s+/g, ' ')
-    .trim()
-    // Long enough to stay recognisable, short enough that the whole path fits.
-    .slice(0, 120)
-    // A trailing dot or space is silently stripped by Windows, which turns two different
-    // papers into one filename.
-    .replace(/[. ]+$/, '');
+  const clean = safeNamePart(title);
   if (clean) return `${clean}.pdf`;
-  if (doi) return `${doi.replace(/[\\/:*?"<>|]/g, '-')}.pdf`;
+  // Through the SAME sanitiser as the title, not a looser one of its own.
+  //
+  // A DOI is publisher-supplied text that reaches this function unvalidated, and its own
+  // rule stripped separators while leaving control characters, a trailing dot and any
+  // length at all. Three sanitisers with three sets of rules is how one of them ends up
+  // being the weak one; there is now a single definition and every fallback uses it.
+  // The separator becomes a hyphen BEFORE sanitising, so `10.1038/nature12373` still reads
+  // as one identifier rather than two words; the sanitiser would otherwise blank it to a
+  // space. Everything hostile about the string is still handled below, by the one rule.
+  const fromDoi = safeNamePart(doi ? String(doi).replace(/[\\/]/g, '-') : null);
+  if (fromDoi) return `${fromDoi}.pdf`;
   // A pasted url has no DOI and therefore no Crossref title, so its own basename is the only
   // thing that distinguishes it. Without this every such download lands as paper.pdf, and
   // the second one becomes "paper (1).pdf" -- a folder of files named after nothing.
@@ -2179,20 +2233,55 @@ function pdfFilename(title, doi, pdfUrl) {
   return base ? `${base}.pdf` : 'paper.pdf';
 }
 
-/** The last path segment of a url, sanitised, with any .pdf suffix removed. */
+/**
+ * One name fragment, safe to hand to the download manager on any filesystem.
+ *
+ * The ONLY sanitiser. Everything that can name a file -- the title, the DOI, a url basename
+ * -- goes through here, so there is one place to check and no second rule to be the lax one.
+ *
+ * A LEADING dot is stripped along with a trailing one. `..` is the traversal segment, and a
+ * name beginning with a dot is hidden on unix -- neither is anything a paper should be
+ * called, and both arrive for free from a url basename.
+ */
+function safeNamePart(raw) {
+  return String(raw || '')
+    // Path separators and the characters Windows forbids.
+    .replace(/[\\/:*?"<>|]/g, ' ')
+    // Control characters, which are legal on Linux and a trap everywhere else.
+    // eslint-disable-next-line no-control-regex
+    .replace(/[\x00-\x1f\x7f]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+    // Long enough to stay recognisable, short enough that the whole path fits.
+    .slice(0, 120)
+    // A trailing dot or space is silently stripped by Windows, which turns two different
+    // papers into one filename.
+    .replace(/^[. ]+/, '')
+    .replace(/[. ]+$/, '');
+}
+
+/**
+ * The last path segment of a url, sanitised, with any .pdf suffix removed.
+ *
+ * DECODED FIRST, then sanitised -- in that order, and the order is the whole point. A url
+ * like `https://x/%2e%2e%2fetc` has ONE path segment, so splitting on '/' before decoding
+ * hands the sanitiser a segment that still contains an encoded separator; decoding it
+ * afterwards would put `../etc` back into a string nothing looks at again.
+ */
 function pdfUrlBasename(pdfUrl) {
   if (!pdfUrl) return null;
   try {
     const last = new URL(pdfUrl).pathname.split('/').filter(Boolean).pop();
     if (!last) return null;
-    return decodeURIComponent(last)
-      .replace(/\.pdf$/i, '')
-      .replace(/[\\/:*?"<>|]/g, '-')
-      // eslint-disable-next-line no-control-regex
-      .replace(/[\x00-\x1f]/g, ' ')
-      .trim()
-      .slice(0, 120)
-      .replace(/[. ]+$/, '') || null;
+    // decodeURIComponent throws on a lone '%'; a malformed escape is not worth losing the
+    // download over, so the raw segment stands in.
+    let decoded;
+    try {
+      decoded = decodeURIComponent(last);
+    } catch {
+      decoded = last;
+    }
+    return safeNamePart(decoded.replace(/\.pdf$/i, '')) || null;
   } catch {
     return null;
   }
@@ -2484,6 +2573,13 @@ async function retrievePaper({ doi, pdfUrl, email, coreApiKey, only, skip }) {
     } catch (err) {
       attempts.push({ source: 'oa', error: `${err.name}: ${err.message}` });
     }
+  } else if (doi && !email) {
+    // A SKIPPED phase must say it was skipped. Unpaywall and PMC refuse a request carrying no
+    // contact address, so with none the whole cheap phase silently does not happen -- and the
+    // user then reads a failure whose attempts log names only the mirrors, which is
+    // indistinguishable from open access having been asked and having declined. It is also
+    // the one failure here the user can actually fix, so hiding it hides the remedy.
+    attempts.push({ source: 'openaccess', error: 'skipped: no contact email, which Unpaywall and PMC require' });
   }
   devStart('phase:openaccess');
   const cheapWanted = cheap.filter((c) => wanted(c.source));
@@ -2558,13 +2654,89 @@ async function retrievePaper({ doi, pdfUrl, email, coreApiKey, only, skip }) {
   devEnd('phase:openaccess', { tried: cheap.length, won: oaWin ? oaWin.source : null });
   if (oaWin) return deliver(oaWin.source, oaWin.url, oaWin.buf);
 
+  // PHASE 2 -- the publisher that owns this DOI, if any. May open a tab, may wait on a human.
+  //
+  // BEFORE the mirrors, not after. A mirror answers without a challenge and usually faster,
+  // so in any ordering that lets it go first it wins the race on essentially every paywalled
+  // paper and an unsigned mirror copy silently displaces the publisher's authentic file --
+  // and %PDF- is a five-byte sanity check, not proof of integrity. Preferring the publisher
+  // costs seconds on papers that are paywalled anyway, and only on those: anything open
+  // access has already been delivered by phase 1 above and never reaches here.
+  if (doi) {
+    const entry = await findPublisher(doi, pdfUrl || null).catch(() => null);
+    if (entry && !wanted(entry.name)) {
+      devDecide(entry.name, 'skip', 'excluded by the caller', null);
+    } else if (entry) {
+      try {
+        const id = entry.resolveId
+          ? await entry.resolveId(doi, pdfUrl || null, {})
+          : entry.extractId(doi, pdfUrl || null);
+        if (id) {
+          const landing = entry.landingUrl(id);
+          const direct = entry.pdfUrl(id);
+          const out = direct
+            ? await fetchPdf({ url: direct, referer: landing, budgetMs: PUBLISHER_BUDGET_MS })
+            // No constructible pdf url (Mendeley, OUP, ACS): read the link out of the
+            // rendered page, then fetch it down the ordinary path.
+            : await (async () => {
+              // crossOrigin: several publishers serve the file from a DIFFERENT host than
+              // the article page. Measured on OUP: the landing page is academic.oup.com and
+              // the real link is watermark02.silverchair.com/gkaa1100.pdf?token=... -- a
+              // signed, expiring url. The same-origin rule dropped it, so the page's only
+              // real link was discarded and the tab then sat open until its budget ran out,
+              // which read as a hang. ScienceDirect and ACS hand off the same way.
+              //
+              // Safe because the harvest still has to match the publisher's own
+              // preferPdfLink pattern, and the bytes are fetched through the tab that
+              // rendered the link rather than by the worker.
+              const links = await fetchLinks({
+                url: landing, budgetMs: PUBLISHER_BUDGET_MS, crossOrigin: true,
+              });
+              if (!links.ok || !links.links.length) {
+                return { ok: false, error: links.error || 'no pdf links on the page' };
+              }
+              const pick = entry.preferPdfLink
+                ? links.links.find((l) => entry.preferPdfLink.test(l))
+                : links.links[0];
+              // Which link was chosen, and when none was, WHAT was on offer. "no link matched
+              // this publisher" alone cannot be told from "the page had nothing", and the
+              // difference is a one-line pattern fix versus a paywall.
+              devDecide(entry.name, pick ? 'have-link' : 'no-match',
+                pick ? 'a link matched the publisher pattern' : 'no link matched the pattern',
+                {
+                  pattern: entry.preferPdfLink ? String(entry.preferPdfLink) : '(first link)',
+                  offered: links.links.slice(0, 4).map((l) => l.slice(0, 90)),
+                });
+              return pick
+                // budgetMs, or this silently inherits the ONE HOUR human-solve default and a
+                // handoff that never clears holds a tab for the rest of the day. Measured on
+                // OUP: the tab opened with budgetMs 3600000 and simply sat there.
+                ? fetchPdf({ url: pick, referer: landing, budgetMs: PUBLISHER_BUDGET_MS })
+                : { ok: false, error: 'no link matched this publisher' };
+            })();
+          if (out.ok && out.base64) {
+            return { ok: true, source: entry.name, url: direct || landing,
+              base64: out.base64, bytes: out.bytes, attempts };
+          }
+          attempts.push({ source: entry.name, error: out.error || 'publisher produced no pdf' });
+        } else {
+          attempts.push({ source: entry.name, error: 'could not resolve an identifier' });
+        }
+      } catch (err) {
+        attempts.push({ source: entry.name, error: `${err.name}: ${err.message}` });
+      }
+    }
+  }
+
   // ---8<--- mirror phase (stripped for the store build) ---8<---
-  // PHASE 2 -- mirrors. They hold the paywalled majority, and they answer without a
-  // challenge and without a human, and they cost nothing when they miss.
+  // PHASE 3 -- mirrors, LAST. They hold the paywalled majority and they answer without a
+  // challenge and without a human, which is exactly why they must not run earlier: they
+  // would beat the publisher on every paywalled paper and put an unsigned copy on disk in
+  // place of the authentic one. See the note on the publisher phase above.
   //
   // Bounded as a GROUP, not just per source: three sources at 45s each is over two minutes
-  // before the publisher phase has even started, and a download that takes minutes with no
-  // output is indistinguishable from one that has hung.
+  // of tabs opening after the rest of the ladder has already declined, and a download that
+  // takes minutes with no output is indistinguishable from one that has hung.
   const mirrorDeadline = Date.now() + MIRROR_PHASE_BUDGET_MS;
   const parked = await parkedSources();
   // The try opens BEFORE the doi gate so the ceiling is set and cleared by the same block.
@@ -2834,72 +3006,6 @@ async function retrievePaper({ doi, pdfUrl, email, coreApiKey, only, skip }) {
     clearMirrorPhaseDeadline(mirrorDeadline);
   }
   // ---8<--- end mirror phase ---8<---
-  // PHASE 3 -- the publisher that owns this DOI, if any. May open a tab, may wait on a human.
-  if (doi) {
-    const entry = await findPublisher(doi, pdfUrl || null).catch(() => null);
-    if (entry && !wanted(entry.name)) {
-      devDecide(entry.name, 'skip', 'excluded by the caller', null);
-    } else if (entry) {
-      try {
-        const id = entry.resolveId
-          ? await entry.resolveId(doi, pdfUrl || null, {})
-          : entry.extractId(doi, pdfUrl || null);
-        if (id) {
-          const landing = entry.landingUrl(id);
-          const direct = entry.pdfUrl(id);
-          const out = direct
-            ? await fetchPdf({ url: direct, referer: landing, budgetMs: PUBLISHER_BUDGET_MS })
-            // No constructible pdf url (Mendeley, OUP, ACS): read the link out of the
-            // rendered page, then fetch it down the ordinary path.
-            : await (async () => {
-              // crossOrigin: several publishers serve the file from a DIFFERENT host than
-              // the article page. Measured on OUP: the landing page is academic.oup.com and
-              // the real link is watermark02.silverchair.com/gkaa1100.pdf?token=... -- a
-              // signed, expiring url. The same-origin rule dropped it, so the page's only
-              // real link was discarded and the tab then sat open until its budget ran out,
-              // which read as a hang. ScienceDirect and ACS hand off the same way.
-              //
-              // Safe because the harvest still has to match the publisher's own
-              // preferPdfLink pattern, and the bytes are fetched through the tab that
-              // rendered the link rather than by the worker.
-              const links = await fetchLinks({
-                url: landing, budgetMs: PUBLISHER_BUDGET_MS, crossOrigin: true,
-              });
-              if (!links.ok || !links.links.length) {
-                return { ok: false, error: links.error || 'no pdf links on the page' };
-              }
-              const pick = entry.preferPdfLink
-                ? links.links.find((l) => entry.preferPdfLink.test(l))
-                : links.links[0];
-              // Which link was chosen, and when none was, WHAT was on offer. "no link matched
-              // this publisher" alone cannot be told from "the page had nothing", and the
-              // difference is a one-line pattern fix versus a paywall.
-              devDecide(entry.name, pick ? 'have-link' : 'no-match',
-                pick ? 'a link matched the publisher pattern' : 'no link matched the pattern',
-                {
-                  pattern: entry.preferPdfLink ? String(entry.preferPdfLink) : '(first link)',
-                  offered: links.links.slice(0, 4).map((l) => l.slice(0, 90)),
-                });
-              return pick
-                // budgetMs, or this silently inherits the ONE HOUR human-solve default and a
-                // handoff that never clears holds a tab for the rest of the day. Measured on
-                // OUP: the tab opened with budgetMs 3600000 and simply sat there.
-                ? fetchPdf({ url: pick, referer: landing, budgetMs: PUBLISHER_BUDGET_MS })
-                : { ok: false, error: 'no link matched this publisher' };
-            })();
-          if (out.ok && out.base64) {
-            return { ok: true, source: entry.name, url: direct || landing,
-              base64: out.base64, bytes: out.bytes, attempts };
-          }
-          attempts.push({ source: entry.name, error: out.error || 'publisher produced no pdf' });
-        } else {
-          attempts.push({ source: entry.name, error: 'could not resolve an identifier' });
-        }
-      } catch (err) {
-        attempts.push({ source: entry.name, error: `${err.name}: ${err.message}` });
-      }
-    }
-  }
 
   devDecide('RESULT', 'fail', 'every source declined',
     { tried: attempts.map((a) => a.source) });
@@ -2955,6 +3061,14 @@ async function fetchValidatedPdf(url, { timeoutMs = 25000 } = {}) {
     const buf = await res.arrayBuffer();
     if (buf.byteLength > MAX_PDF_BYTES) return { ok: false, error: 'too large' };
     if (buf.byteLength < 5) return { ok: false, error: `too short (${buf.byteLength})` };
+    // The body must match what the origin SAID it was sending. A connection cut mid-transfer
+    // gives a short body with the magic intact, so every check below still passes and a
+    // half-downloaded paper is saved as if it were whole -- and the ladder STOPS, because a
+    // win ends it, so the complete copy the next source held is never fetched. Only a
+    // mismatch is fatal: chunked and compressed responses declare no length at all.
+    if (Number.isFinite(declared) && declared > 0 && buf.byteLength < declared) {
+      return { ok: false, error: `truncated (${buf.byteLength} of ${declared})` };
+    }
     const magic = new TextDecoder().decode(new Uint8Array(buf, 0, 5));
     if (magic !== '%PDF-') {
       // A CHALLENGE page is not the same failure as a wrong url, and only the first is worth
@@ -2971,6 +3085,17 @@ async function fetchValidatedPdf(url, { timeoutMs = 25000 } = {}) {
         error: `not a pdf (${JSON.stringify(magic)})${challenged ? ' -- challenge page' : ''}`,
       };
     }
+    // The magic alone accepts a five-byte "%PDF-" and any HTML error page that happens to
+    // begin with it. A real pdf carries a trailer, so requiring one is what separates a
+    // document from a fragment that merely starts like one. Searched from the END because
+    // that is where it lives and because an incremental save leaves several behind.
+    if (buf.byteLength < MIN_PDF_BYTES) {
+      return { ok: false, error: `too small to be a pdf (${buf.byteLength})` };
+    }
+    const tail = new TextDecoder('latin1').decode(
+      new Uint8Array(buf, buf.byteLength - Math.min(2048, buf.byteLength)),
+    );
+    if (!/%%EOF/.test(tail)) return { ok: false, error: 'pdf has no trailer (truncated)' };
     return { ok: true, buf, bytes: buf.byteLength };
   } catch (err) {
     return { ok: false, error: `${err.name}: ${err.message}` };
@@ -4074,10 +4199,14 @@ async function searchPubmed(query, maxResults, page, filters = {}) {
  * with CSH journal articles, so the client-side pass sees zero preprints and the source
  * silently returns nothing. So: type server-side, prefix client-side.
  */
-async function searchBiorxiv(query, maxResults, filters = {}) {
+async function searchBiorxiv(query, maxResults, page, filters = {}) {
   const u = new URL('https://api.crossref.org/works');
   // Crossref splits the query by field and the date bounds into `filter`, both measured.
-  if (filters.titleOnly) u.searchParams.set('query.bibliographic', query);
+  // query.title, not query.bibliographic: `bibliographic` matches title AND author AND
+  // container AND year together, so titleOnly here was not a title restriction at all --
+  // the filter was accepted and then silently not applied. The crossref adapter beside this
+  // one already uses query.title, and it still answers 200 (verified live).
+  if (filters.titleOnly) u.searchParams.set('query.title', query);
   else u.searchParams.set('query', query);
   if (filters.author) u.searchParams.set('query.author', filters.author);
   const filterParts = ['type:posted-content'];
@@ -4091,7 +4220,19 @@ async function searchBiorxiv(query, maxResults, filters = {}) {
   // Over-fetch hard. Of 100 posted-content rows only 44/64/14/0 were 10.1101 across four
   // measured queries, so a 100 ceiling routinely returned far fewer than asked with no
   // signal. Crossref allows rows=1000.
-  u.searchParams.set('rows', String(Math.min(Math.max(maxResults * 12, 100), 400)));
+  const overFetch = Math.min(Math.max(maxResults * 12, 100), 400);
+  u.searchParams.set('rows', String(overFetch));
+  // `page` was accepted and then DROPPED: this adapter took no page argument at all, so
+  // page 2 re-issued the identical request and returned page 1's rows again -- silently,
+  // since a repeated result set looks exactly like a source with nothing more to give.
+  // The window paged is the over-fetch window, because the 10.1101 filter runs client-side:
+  // page 2 must skip the whole page-1 candidate set, not just the maxResults that survived
+  // it. Crossref caps offset+rows at 10000, so ask for what is reachable and no more.
+  const offset = (page - 1) * overFetch;
+  if (offset > 0) {
+    if (offset + overFetch > 10000) return { source: 'biorxiv', results: [] };
+    u.searchParams.set('offset', String(offset));
+  }
 
   const res = await getJson(u.toString());
   if (!res.ok) return { source: 'biorxiv', error: res.error, results: [] };
@@ -4277,12 +4418,20 @@ async function searchCrossref(query, maxResults, page, filters = {}) {
  */
 async function searchOpenAlex(query, maxResults, page, filters = {}) {
   const u = new URL('https://api.openalex.org/works');
-  if (filters.titleOnly) u.searchParams.set('filter', `title.search:${query}`);
+  // A COMMA separates filters in OpenAlex's syntax, so a comma inside a value is a syntax
+  // error and not a search term. Measured: filter=title.search:cells, tissues answers
+  // 400 "A filter value contains an unescaped comma" -- so any query containing a comma
+  // ("Cells, Tissues and Organs", an author given as "Smith, John") removed OpenAlex from
+  // the search entirely. Percent-encoding does NOT help; the proxy rejects %2C too. Wrapping
+  // the value in double quotes does, and is safe for values with no comma (verified: quoted
+  // "perovskite solar cell" and "Schrödinger" both 200 with sane hit counts).
+  const filterValue = (v) => `"${String(v).replace(/"/g, ' ').trim()}"`;
+  if (filters.titleOnly) u.searchParams.set('filter', `title.search:${filterValue(query)}`);
   else u.searchParams.set('search', query);
   const f = [];
   if (Number.isFinite(filters.yearFrom)) f.push(`from_publication_date:${filters.yearFrom}-01-01`);
   if (Number.isFinite(filters.yearTo)) f.push(`to_publication_date:${filters.yearTo}-12-31`);
-  if (filters.author) f.push(`raw_author_name.search:${filters.author}`);
+  if (filters.author) f.push(`raw_author_name.search:${filterValue(filters.author)}`);
   if (f.length) {
     const existing = u.searchParams.get('filter');
     u.searchParams.set('filter', existing ? `${existing},${f.join(',')}` : f.join(','));
@@ -4457,8 +4606,15 @@ async function searchSemanticScholar(query, maxResults, page, filters = {}) {
     'title,abstract,year,venue,citationCount,externalIds,openAccessPdf,publicationTypes,authors.name',
   );
 
+  // The search endpoint has no author or title field -- `query` is a single free-text match
+  // over the whole record. Both filters were accepted and then never sent, which is the
+  // silent-drop this array exists to prevent: the caller believed S2 had applied them.
+  const unsupported = [];
+  if (filters.author) unsupported.push('author');
+  if (filters.titleOnly) unsupported.push('titleOnly');
+
   const credentials = credentialsFor(u.toString());
-  if (credentials === null) return { source: 'semanticscholar', error: 'host not allowlisted', results: [] };
+  if (credentials === null) return { source: 'semanticscholar', error: 'host not allowlisted', results: [], unsupported };
   const headers = { accept: 'application/json' };
   // Sent only when present. An EMPTY X-API-KEY is not the same as none -- it was measured
   // being refused just as an anonymous request is, so an empty string must not be forwarded.
@@ -4477,15 +4633,16 @@ async function searchSemanticScholar(query, maxResults, page, filters = {}) {
           : 'the shared anonymous quota is exhausted -- a free API key '
             + '(semanticscholar.org/product/api) gives you your own',
         results: [],
+        unsupported,
       };
     }
     if (res.status === 401 || res.status === 403) {
-      return { source: 'semanticscholar', error: 'the API key was rejected', results: [] };
+      return { source: 'semanticscholar', error: 'the API key was rejected', results: [], unsupported };
     }
-    if (!res.ok) return { source: 'semanticscholar', error: `http ${res.status}`, results: [] };
+    if (!res.ok) return { source: 'semanticscholar', error: `http ${res.status}`, results: [], unsupported };
     data = await res.json();
   } catch (err) {
-    return { source: 'semanticscholar', error: `${err.name}: ${err.message}`, results: [] };
+    return { source: 'semanticscholar', error: `${err.name}: ${err.message}`, results: [], unsupported };
   }
 
   const results = (data?.data || []).map((p) => ({
@@ -4508,7 +4665,7 @@ async function searchSemanticScholar(query, maxResults, page, filters = {}) {
     // An arXiv id with no DOI means the row IS the preprint, which is worth saying.
     source: (!p.externalIds?.DOI && p.externalIds?.ArXiv) ? 'arXiv' : 'semanticscholar',
   })).filter((r) => r.title);
-  return { source: 'semanticscholar', results };
+  return { source: 'semanticscholar', results, unsupported };
 }
 
 // --- entry point ---------------------------------------------------------------------
@@ -4538,7 +4695,17 @@ const OPTIONAL_SEARCH_SOURCES = ['semanticscholar'];
 /**
  * Query one source. Never throws; a failed source reports `error` and an empty list.
  */
-async function searchOne(source, { query, maxResults = 10, page = 1, filters = {} }) {
+async function searchOne(source, opts) {
+  // Destructured DEFAULTS are not a guard: `{filters = {}}` only fires for `undefined`, so
+  // `filters: null` threw on the first property read, and `searchOne(s, undefined)` threw on
+  // the destructuring itself. Either one rejects the promise -- and searchAll's Promise.all
+  // then fails the WHOLE page, which is exactly the failure mode the never-throw contract
+  // exists to prevent. Normalise instead of assuming the caller is well behaved.
+  const o = (opts && typeof opts === 'object') ? opts : {};
+  const query = o.query;
+  const maxResults = Number.isFinite(o.maxResults) ? o.maxResults : 10;
+  const page = Number.isFinite(o.page) && o.page >= 1 ? Math.floor(o.page) : 1;
+  const filters = (o.filters && typeof o.filters === 'object') ? o.filters : {};
   // Also set here, not only in searchAll: searchOne is a public entry point and is called
   // directly, so relying on searchAll to have run first would drop the contact for exactly
   // the single-source callers.
@@ -4575,7 +4742,7 @@ async function searchOne(source, { query, maxResults = 10, page = 1, filters = {
     case 'ssrn': return searchSsrn(query, n, page, filters);
     case 'arxiv': return searchArxiv(query, n, page, filters);
     case 'pubmed': return searchPubmed(query, n, page, filters);
-    case 'biorxiv': return searchBiorxiv(query, n, filters);
+    case 'biorxiv': return searchBiorxiv(query, n, page, filters);
     default: return { source, error: `unknown source: ${source}`, results: [] };
   }
 }
@@ -4612,6 +4779,15 @@ async function lookupByDoi(doi, source) {
         .filter(Boolean),
       year: it.issued?.['date-parts']?.[0]?.[0] ? String(it.issued['date-parts'][0][0]) : null,
       abstract: it.abstract ? stripTags(it.abstract) : null,
+      // The three fields every other adapter emits were simply absent here, and an absent
+      // field is not the same as a null one: the host's re-shaper defaults them, but every
+      // consumer between here and there reads the record raw, so a DOI lookup produced a
+      // row shaped unlike every search row. Crossref sends all three on /works/<doi>.
+      venue: Array.isArray(it['container-title']) ? it['container-title'][0] : null,
+      citationCount: Number.isFinite(it['is-referenced-by-count'])
+        ? it['is-referenced-by-count']
+        : null,
+      type: typeof it.type === 'string' ? it.type : null,
       source: 'crossref',
     }],
   };

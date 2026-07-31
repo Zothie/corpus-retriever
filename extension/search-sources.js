@@ -481,10 +481,14 @@ async function searchPubmed(query, maxResults, page, filters = {}) {
  * with CSH journal articles, so the client-side pass sees zero preprints and the source
  * silently returns nothing. So: type server-side, prefix client-side.
  */
-async function searchBiorxiv(query, maxResults, filters = {}) {
+async function searchBiorxiv(query, maxResults, page, filters = {}) {
   const u = new URL('https://api.crossref.org/works');
   // Crossref splits the query by field and the date bounds into `filter`, both measured.
-  if (filters.titleOnly) u.searchParams.set('query.bibliographic', query);
+  // query.title, not query.bibliographic: `bibliographic` matches title AND author AND
+  // container AND year together, so titleOnly here was not a title restriction at all --
+  // the filter was accepted and then silently not applied. The crossref adapter beside this
+  // one already uses query.title, and it still answers 200 (verified live).
+  if (filters.titleOnly) u.searchParams.set('query.title', query);
   else u.searchParams.set('query', query);
   if (filters.author) u.searchParams.set('query.author', filters.author);
   const filterParts = ['type:posted-content'];
@@ -498,7 +502,19 @@ async function searchBiorxiv(query, maxResults, filters = {}) {
   // Over-fetch hard. Of 100 posted-content rows only 44/64/14/0 were 10.1101 across four
   // measured queries, so a 100 ceiling routinely returned far fewer than asked with no
   // signal. Crossref allows rows=1000.
-  u.searchParams.set('rows', String(Math.min(Math.max(maxResults * 12, 100), 400)));
+  const overFetch = Math.min(Math.max(maxResults * 12, 100), 400);
+  u.searchParams.set('rows', String(overFetch));
+  // `page` was accepted and then DROPPED: this adapter took no page argument at all, so
+  // page 2 re-issued the identical request and returned page 1's rows again -- silently,
+  // since a repeated result set looks exactly like a source with nothing more to give.
+  // The window paged is the over-fetch window, because the 10.1101 filter runs client-side:
+  // page 2 must skip the whole page-1 candidate set, not just the maxResults that survived
+  // it. Crossref caps offset+rows at 10000, so ask for what is reachable and no more.
+  const offset = (page - 1) * overFetch;
+  if (offset > 0) {
+    if (offset + overFetch > 10000) return { source: 'biorxiv', results: [] };
+    u.searchParams.set('offset', String(offset));
+  }
 
   const res = await getJson(u.toString());
   if (!res.ok) return { source: 'biorxiv', error: res.error, results: [] };
@@ -684,12 +700,20 @@ async function searchCrossref(query, maxResults, page, filters = {}) {
  */
 async function searchOpenAlex(query, maxResults, page, filters = {}) {
   const u = new URL('https://api.openalex.org/works');
-  if (filters.titleOnly) u.searchParams.set('filter', `title.search:${query}`);
+  // A COMMA separates filters in OpenAlex's syntax, so a comma inside a value is a syntax
+  // error and not a search term. Measured: filter=title.search:cells, tissues answers
+  // 400 "A filter value contains an unescaped comma" -- so any query containing a comma
+  // ("Cells, Tissues and Organs", an author given as "Smith, John") removed OpenAlex from
+  // the search entirely. Percent-encoding does NOT help; the proxy rejects %2C too. Wrapping
+  // the value in double quotes does, and is safe for values with no comma (verified: quoted
+  // "perovskite solar cell" and "Schrödinger" both 200 with sane hit counts).
+  const filterValue = (v) => `"${String(v).replace(/"/g, ' ').trim()}"`;
+  if (filters.titleOnly) u.searchParams.set('filter', `title.search:${filterValue(query)}`);
   else u.searchParams.set('search', query);
   const f = [];
   if (Number.isFinite(filters.yearFrom)) f.push(`from_publication_date:${filters.yearFrom}-01-01`);
   if (Number.isFinite(filters.yearTo)) f.push(`to_publication_date:${filters.yearTo}-12-31`);
-  if (filters.author) f.push(`raw_author_name.search:${filters.author}`);
+  if (filters.author) f.push(`raw_author_name.search:${filterValue(filters.author)}`);
   if (f.length) {
     const existing = u.searchParams.get('filter');
     u.searchParams.set('filter', existing ? `${existing},${f.join(',')}` : f.join(','));
@@ -864,8 +888,15 @@ async function searchSemanticScholar(query, maxResults, page, filters = {}) {
     'title,abstract,year,venue,citationCount,externalIds,openAccessPdf,publicationTypes,authors.name',
   );
 
+  // The search endpoint has no author or title field -- `query` is a single free-text match
+  // over the whole record. Both filters were accepted and then never sent, which is the
+  // silent-drop this array exists to prevent: the caller believed S2 had applied them.
+  const unsupported = [];
+  if (filters.author) unsupported.push('author');
+  if (filters.titleOnly) unsupported.push('titleOnly');
+
   const credentials = credentialsFor(u.toString());
-  if (credentials === null) return { source: 'semanticscholar', error: 'host not allowlisted', results: [] };
+  if (credentials === null) return { source: 'semanticscholar', error: 'host not allowlisted', results: [], unsupported };
   const headers = { accept: 'application/json' };
   // Sent only when present. An EMPTY X-API-KEY is not the same as none -- it was measured
   // being refused just as an anonymous request is, so an empty string must not be forwarded.
@@ -884,15 +915,16 @@ async function searchSemanticScholar(query, maxResults, page, filters = {}) {
           : 'the shared anonymous quota is exhausted -- a free API key '
             + '(semanticscholar.org/product/api) gives you your own',
         results: [],
+        unsupported,
       };
     }
     if (res.status === 401 || res.status === 403) {
-      return { source: 'semanticscholar', error: 'the API key was rejected', results: [] };
+      return { source: 'semanticscholar', error: 'the API key was rejected', results: [], unsupported };
     }
-    if (!res.ok) return { source: 'semanticscholar', error: `http ${res.status}`, results: [] };
+    if (!res.ok) return { source: 'semanticscholar', error: `http ${res.status}`, results: [], unsupported };
     data = await res.json();
   } catch (err) {
-    return { source: 'semanticscholar', error: `${err.name}: ${err.message}`, results: [] };
+    return { source: 'semanticscholar', error: `${err.name}: ${err.message}`, results: [], unsupported };
   }
 
   const results = (data?.data || []).map((p) => ({
@@ -915,7 +947,7 @@ async function searchSemanticScholar(query, maxResults, page, filters = {}) {
     // An arXiv id with no DOI means the row IS the preprint, which is worth saying.
     source: (!p.externalIds?.DOI && p.externalIds?.ArXiv) ? 'arXiv' : 'semanticscholar',
   })).filter((r) => r.title);
-  return { source: 'semanticscholar', results };
+  return { source: 'semanticscholar', results, unsupported };
 }
 
 // --- entry point ---------------------------------------------------------------------
@@ -945,7 +977,17 @@ export const OPTIONAL_SEARCH_SOURCES = ['semanticscholar'];
 /**
  * Query one source. Never throws; a failed source reports `error` and an empty list.
  */
-export async function searchOne(source, { query, maxResults = 10, page = 1, filters = {} }) {
+export async function searchOne(source, opts) {
+  // Destructured DEFAULTS are not a guard: `{filters = {}}` only fires for `undefined`, so
+  // `filters: null` threw on the first property read, and `searchOne(s, undefined)` threw on
+  // the destructuring itself. Either one rejects the promise -- and searchAll's Promise.all
+  // then fails the WHOLE page, which is exactly the failure mode the never-throw contract
+  // exists to prevent. Normalise instead of assuming the caller is well behaved.
+  const o = (opts && typeof opts === 'object') ? opts : {};
+  const query = o.query;
+  const maxResults = Number.isFinite(o.maxResults) ? o.maxResults : 10;
+  const page = Number.isFinite(o.page) && o.page >= 1 ? Math.floor(o.page) : 1;
+  const filters = (o.filters && typeof o.filters === 'object') ? o.filters : {};
   // Also set here, not only in searchAll: searchOne is a public entry point and is called
   // directly, so relying on searchAll to have run first would drop the contact for exactly
   // the single-source callers.
@@ -982,7 +1024,7 @@ export async function searchOne(source, { query, maxResults = 10, page = 1, filt
     case 'ssrn': return searchSsrn(query, n, page, filters);
     case 'arxiv': return searchArxiv(query, n, page, filters);
     case 'pubmed': return searchPubmed(query, n, page, filters);
-    case 'biorxiv': return searchBiorxiv(query, n, filters);
+    case 'biorxiv': return searchBiorxiv(query, n, page, filters);
     default: return { source, error: `unknown source: ${source}`, results: [] };
   }
 }
@@ -1019,6 +1061,15 @@ async function lookupByDoi(doi, source) {
         .filter(Boolean),
       year: it.issued?.['date-parts']?.[0]?.[0] ? String(it.issued['date-parts'][0][0]) : null,
       abstract: it.abstract ? stripTags(it.abstract) : null,
+      // The three fields every other adapter emits were simply absent here, and an absent
+      // field is not the same as a null one: the host's re-shaper defaults them, but every
+      // consumer between here and there reads the record raw, so a DOI lookup produced a
+      // row shaped unlike every search row. Crossref sends all three on /works/<doi>.
+      venue: Array.isArray(it['container-title']) ? it['container-title'][0] : null,
+      citationCount: Number.isFinite(it['is-referenced-by-count'])
+        ? it['is-referenced-by-count']
+        : null,
+      type: typeof it.type === 'string' ? it.type : null,
       source: 'crossref',
     }],
   };

@@ -160,26 +160,34 @@ function load(downloads = {}, fetchImpl = null, tabsWork = false) {
     }
     static now() { return Date.now() + skew.ms; }
   }
+  // A URL subclass with no Blob-URL store, matching a real MV3 service worker. Subclassing
+  // rather than mutating the global keeps every other test and Node itself untouched.
+  class WorkerURL extends URL {}
+  WorkerURL.createObjectURL = undefined;
+  WorkerURL.revokeObjectURL = undefined;
+  WorkerURL.canParse = URL.canParse?.bind(URL);
   const f = new Function(
     'chrome', 'console', 'URL', 'fetch', 'self', 'Date',
     `${src}\nreturn { pdfFilename, downloadToBrowser, retrievePaper, parseDownloadInput, fetchPdf, fetchLinks,`
-    + `\n  slimPdf, bytesToBase64, base64ToBytes,`
+    + `\n  slimPdf, bytesToBase64, base64ToBytes, fetchValidatedPdf, isGlobalFailure,`
     + `\n  setProbe: (fn) => { probeAvailability = fn; },`
     + `\n  mirrorPhaseDeadline: () => currentMirrorCeiling(),\n  setMirrorPhaseDeadline, clearMirrorPhaseDeadline };`,
   );
   const api = f(
     chrome,
     { warn() {}, log() {}, error() {} },
-    // The REAL URL, unmodified.
+    // The real URL parser, with the two Blob-URL methods REMOVED.
     //
-    // This is the whole point. The previous harness passed a FakeURL carrying
-    // createObjectURL/revokeObjectURL, so the blob path "worked" in tests and threw
-    // TypeError in every real download -- an MV3 service worker has no Blob URL store and
-    // therefore no URL.createObjectURL at all. The stub was testing itself.
+    // The previous harness passed a FakeURL carrying createObjectURL/revokeObjectURL, so the
+    // blob path "worked" in tests and threw TypeError in every real download. Passing Node's
+    // bare `URL` was meant to fix that, on the belief that Node has no createObjectURL --
+    // it does (verified: Node 20 exposes both, and so did the version this ran under), so the
+    // stub was quietly testing itself again by a second route.
     //
-    // Node's URL has no createObjectURL either, which is exactly the environment the worker
-    // actually runs in, so a regression to the blob path fails here instead of shipping.
-    URL,
+    // Verified against a real loaded MV3 worker: typeof URL.createObjectURL === 'undefined'.
+    // Deleting them here reproduces that environment, so a regression to the blob path throws
+    // in this harness exactly as it would in Chrome, instead of passing and shipping.
+    WorkerURL,
     fetchImpl || (async () => { throw new Error('the network is not available in this test'); }),
     self,
     ClockDate,
@@ -243,8 +251,27 @@ test('a url with no DOI keeps its own basename', () => {
   assert.equal(pdfFilename(null, null, 'https://arxiv.org/pdf/2301.00001v2'), '2301.00001v2.pdf');
   assert.equal(pdfFilename(null, null, 'https://example.org/a/b/paper.pdf'), 'paper.pdf');
   // A basename that is itself a traversal attempt must not survive as one.
-  const out = pdfFilename(null, null, 'https://example.org/x/%2e%2e%2f%2e%2e%2fetc');
-  assert.doesNotMatch(out, /[\\/]/, `basename reintroduced a separator: ${out}`);
+  //
+  // Asserting only "no separator" is what let this through: the segment was split BEFORE it
+  // was decoded, so `%2e%2e%2fetc` reached the sanitiser as one opaque token, came out as
+  // `..-etc.pdf`, and passed a test looking for slashes. The dot-dot is the dangerous half,
+  // so it is now asserted directly.
+  for (const u of [
+    'https://example.org/x/%2e%2e%2f%2e%2e%2fetc',
+    'https://example.org/%2e%2e%5c%2e%2e%5cwindows',
+    'https://example.org/x/..%2f..%2fetc',
+  ]) {
+    const out = pdfFilename(null, null, u);
+    assert.doesNotMatch(out, /[\\/]/, `basename reintroduced a separator: ${out}`);
+    assert.doesNotMatch(out, /\.\./, `basename kept a traversal segment: ${out}`);
+    assert.ok(!out.startsWith('.'), `basename produced a dotfile: ${out}`);
+  }
+  // The DOI fallback is publisher-supplied text too, and used to run through a LOOSER rule of
+  // its own that stripped separators while leaving control characters behind.
+  const fromDoi = pdfFilename(null, '10.1/../../etc\u0001x');
+  assert.doesNotMatch(fromDoi, /[\\/]/, fromDoi);
+  // eslint-disable-next-line no-control-regex
+  assert.doesNotMatch(fromDoi, /[\x00-\x1f]/, 'a control character survived into the filename');
   // A url with no usable path segment still produces something.
   assert.equal(pdfFilename(null, null, 'https://example.org/'), 'paper.pdf');
   assert.equal(pdfFilename(null, null, 'not a url'), 'paper.pdf');
@@ -340,7 +367,7 @@ test('a url on a host the extension does not carry SAYS so', async () => {
   assert.deepEqual(out.attempts, [{ source: 'direct', error: 'host not allowlisted' }]);
 });
 
-test('the mirrors keep their order, and still precede the publisher', async () => {
+test('the mirrors keep their order, and run only after the publisher', async () => {
   // The ladder order is load-bearing and was previously asserted nowhere, so it could be
   // reordered -- as it has been -- with the whole suite still green. `attempts` is the
   // order the sources actually ran in, which is the thing worth pinning.
@@ -355,24 +382,24 @@ test('the mirrors keep their order, and still precede the publisher', async () =
   const mirrors = order.filter((s) => ['scihub', 'annas', 'libgen'].includes(s));
   assert.deepEqual(mirrors, ['scihub', 'annas', 'libgen'], `ran: ${order.join(' -> ')}`);
 
-  // Mirrors keep their RELATIVE order, but open access now precedes them: measured, a mirror
-  // serves at 23 KB/s against 517 for an open-access host, and open access frequently holds
-  // the paywalled paper too. What must not change is that a mirror never runs before the
-  // cheap phase, and that the publisher tab stays last.
+  // Mirrors keep their RELATIVE order and go LAST as a group. A mirror answers without a
+  // challenge and usually faster, so any ordering that lets one run first hands it every
+  // paywalled paper -- and an unsigned mirror copy must never displace the publisher's
+  // authentic file, %PDF- being a five-byte sanity check rather than proof of integrity.
   assert.ok(
-    order.indexOf('scihub') < order.indexOf('nature'),
-    `a publisher ran before the mirrors: ${order.join(' -> ')}`,
+    order.indexOf('nature') < order.indexOf('scihub'),
+    `a mirror ran before the publisher: ${order.join(' -> ')}`,
   );
 });
 
-test('all three phases run in order: open access, then mirrors, then the publisher', async () => {
-  // The publisher phase is the only one that can open a tab and demand the user solve a
-  // challenge, so it must stay last. If it drifts ahead of the free sources, the cost of
-  // a download becomes the user's attention rather than a few seconds of waiting.
+test('all three phases run in order: open access, then the publisher, then mirrors', async () => {
+  // The mirrors go last, and that is the load-bearing half of this assertion: they answer
+  // without a challenge and would otherwise win every paywalled paper, putting an unsigned
+  // copy on disk in place of the publisher's authentic file.
   //
-  // Phase 2 is otherwise INVISIBLE in `attempts` -- resolveOaCandidates swallows its own
+  // Phase 1 is otherwise INVISIBLE in `attempts` -- resolveOaCandidates swallows its own
   // failures, so a phase that found nothing logs nothing. A refused `direct` url is the
-  // one entry that phase always emits, so it serves as the marker for where phase 2 ran.
+  // one entry that phase always emits, so it serves as the marker for where phase 1 ran.
   const { retrievePaper } = load({}, async () => { throw new Error('offline'); });
   const out = await retrievePaper({
     doi: '10.1038/nature12373',
@@ -381,7 +408,7 @@ test('all three phases run in order: open access, then mirrors, then the publish
   });
 
   const order = out.attempts.map((a) => a.source);
-  assert.deepEqual(order, ['direct', 'scihub', 'annas', 'libgen', 'nature'], order.join(' -> '));
+  assert.deepEqual(order, ['direct', 'nature', 'scihub', 'annas', 'libgen'], order.join(' -> '));
 });
 
 test('the mirror phase ceiling is cleared when the phase ends', async () => {
@@ -521,7 +548,7 @@ test('a retrieval with no DOI does not poison the next call\'s mirror phase', as
   // And prove the consequence, not just the flag: the mirrors must still run afterwards.
   const out = await api.retrievePaper({ doi: '10.1038/nature12373', email: 'a@b.c' });
   const order = out.attempts.map((a) => a.source);
-  assert.deepEqual(order.slice(0, 3), ['scihub', 'annas', 'libgen'], order.join(' -> '));
+  assert.deepEqual(order.slice(-3), ['scihub', 'annas', 'libgen'], order.join(' -> '));
 });
 
 // --- the availability probe's hints, as the ladder consumes them ----------------------
@@ -613,7 +640,7 @@ test('hints with no mirror in them -- the store build\'s shape -- change nothing
   });
 
   const order = out.attempts.map((a) => a.source);
-  assert.deepEqual(order, ['direct', 'scihub', 'annas', 'libgen', 'nature'], order.join(' -> '));
+  assert.deepEqual(order, ['direct', 'nature', 'scihub', 'annas', 'libgen'], order.join(' -> '));
 });
 
 /** A Response-shaped stub carrying `bytes`, enough for workerFetch's checks. */
@@ -701,4 +728,98 @@ test('a link on a host we do not carry is still refused', async () => {
   api.setPageLinks(['https://sci-hub.ru/storage/a.pdf', 'https://evil.example/x.pdf']);
   const out = await api.fetchLinks({ url: 'https://sci-hub.ru/10.1/x', budgetMs: 5000 });
   assert.deepEqual(out.links, ['https://sci-hub.ru/storage/a.pdf']);
+});
+
+// --- what counts as a pdf ------------------------------------------------------------
+
+/** A response stub for one body, with whatever headers the case needs. */
+const bodyResponse = (body, headers = {}) => async () => ({
+  ok: true,
+  status: 200,
+  headers: { get: (k) => headers[k.toLowerCase()] ?? null },
+  arrayBuffer: async () => new TextEncoder().encode(body).buffer,
+});
+
+/** A pdf that is genuinely whole: magic, enough body to be a document, and a trailer. */
+const wholePdf = `%PDF-1.7\n${'0'.repeat(1024)}\n%%EOF\n`;
+
+test('a whole pdf validates', async () => {
+  const { fetchValidatedPdf } = load({}, bodyResponse(wholePdf));
+  const r = await fetchValidatedPdf('https://arxiv.org/pdf/2301.00001');
+  assert.equal(r.ok, true, r.error);
+});
+
+test('a body SHORTER than the origin declared is refused as truncated', async () => {
+  // The failure this exists for is silent: a connection cut mid-transfer leaves the magic
+  // intact, so every other check passes and half a paper is saved as though it were whole.
+  // Worse, a win ENDS the ladder -- the source that held the complete file is never asked.
+  const { fetchValidatedPdf } = load({}, bodyResponse(wholePdf, { 'content-length': '999999' }));
+  const r = await fetchValidatedPdf('https://arxiv.org/pdf/2301.00001');
+  assert.equal(r.ok, false);
+  assert.match(r.error, /truncated/);
+});
+
+test('a pdf with no trailer is refused', async () => {
+  // %PDF- is five bytes at the FRONT. A document also ends somewhere, and a body that starts
+  // like a pdf but never finishes one is a fragment, not a paper.
+  const { fetchValidatedPdf } = load({}, bodyResponse(`%PDF-1.7\n${'0'.repeat(1024)}`));
+  const r = await fetchValidatedPdf('https://arxiv.org/pdf/2301.00001');
+  assert.equal(r.ok, false);
+  assert.match(r.error, /trailer|truncated/);
+});
+
+test('a five-byte "pdf" is refused', async () => {
+  // The magic alone accepted this, and accepting it costs the user the paper: it wins the
+  // ladder, so the sources that had the real file are never tried.
+  const { fetchValidatedPdf } = load({}, bodyResponse('%PDF-'));
+  const r = await fetchValidatedPdf('https://arxiv.org/pdf/2301.00001');
+  assert.equal(r.ok, false);
+  assert.match(r.error, /too small|too short/);
+});
+
+test('an HTML error page served as application/pdf is refused', async () => {
+  // The content-type is the origin's claim; the bytes are the evidence. Only the bytes decide.
+  const { fetchValidatedPdf } = load({}, bodyResponse(
+    `<!doctype html><title>404</title>${'x'.repeat(2048)}`,
+    { 'content-type': 'application/pdf' },
+  ));
+  const r = await fetchValidatedPdf('https://arxiv.org/pdf/2301.00001');
+  assert.equal(r.ok, false);
+  assert.match(r.error, /not a pdf/);
+});
+
+// --- the outage breaker --------------------------------------------------------------
+
+test('a spent phase budget does NOT park a source', () => {
+  // "budget exhausted" describes the LADDER'S CLOCK and the sources that ran before it --
+  // never the health of the source it is recorded against. A source that never made a
+  // request is the one thing that cannot have been observed to be down.
+  //
+  // Parking on it was self-reinforcing: a slow sci-hub spends the phase, libgen is skipped
+  // as "budget exhausted", libgen is parked for thirty minutes, and every download for the
+  // next half hour loses a healthy mirror that was never asked.
+  const { isGlobalFailure } = load();
+  assert.equal(isGlobalFailure('mirror phase budget exhausted'), false);
+  assert.equal(isGlobalFailure('skipped: mirror phase budget exhausted'), false);
+  // A per-paper miss must not park either -- parking libgen for "not on libgen" would lose
+  // every subsequent paper it DOES have.
+  assert.equal(isGlobalFailure('not on libgen (no detail)'), false);
+  assert.equal(isGlobalFailure('no sci-hub mirror served it'), false);
+  assert.equal(isGlobalFailure('http 404'), false);
+  // A genuine outage still parks.
+  assert.equal(isGlobalFailure('no reachable annas mirror'), true);
+  assert.equal(isGlobalFailure('TypeError: Failed to fetch'), true);
+});
+
+test('a phase skipped for want of an email SAYS so', async () => {
+  // Unpaywall and PMC refuse a request with no contact address, so with none the whole cheap
+  // phase silently does not run. Left unlogged, the user reads a failure naming only the
+  // mirrors -- indistinguishable from open access having been asked and having declined, and
+  // it is the one failure here they can actually fix.
+  const api = load({}, async () => { throw new Error('offline'); });
+  const out = await api.retrievePaper({ doi: '10.1038/nature12373' });
+  assert.equal(out.ok, false);
+  const skipped = out.attempts.find((a) => a.source === 'openaccess');
+  assert.ok(skipped, `open access vanished from the log: ${JSON.stringify(out.attempts)}`);
+  assert.match(skipped.error, /skipped: no contact email/);
 });

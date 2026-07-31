@@ -241,7 +241,99 @@ test('biorxiv searches Crossref, filtering type server-side and prefix client-si
   assert.equal(r.year, '2020');
 });
 
+test('biorxiv pages the over-fetch window, so page 2 is not page 1 again', async () => {
+  // The adapter took no `page` argument at all, so a second page re-issued the identical
+  // request. That is invisible from the outside: an unchanged result set reads as a source
+  // with nothing more to give. The offset steps by the OVER-FETCH window rather than by
+  // maxResults, because the 10.1101 filter runs client-side -- page 2 must skip every
+  // candidate page 1 considered, not just the few that survived the filter.
+  const offsets = [];
+  stubFetch(async (url) => {
+    offsets.push(new URL(url).searchParams.get('offset'));
+    return jsonRes({ message: { items: [] } });
+  });
+  await searchOne('biorxiv', { query: 'protein folding', maxResults: 10, page: 1 });
+  await searchOne('biorxiv', { query: 'protein folding', maxResults: 10, page: 2 });
+  assert.equal(offsets[0], null, 'page 1 asks for no offset');
+  assert.equal(offsets[1], '120', 'page 2 skips the whole page-1 candidate window');
+});
+
+test('biorxiv restricts titleOnly to the title, not to every bibliographic field', async () => {
+  // query.bibliographic matches title AND author AND container AND year together, so it is
+  // not a title restriction -- the filter was accepted and then silently not applied.
+  let requested = null;
+  stubFetch(async (url) => { requested = new URL(url); return jsonRes({ message: { items: [] } }); });
+  await searchOne('biorxiv', { query: 'protein folding', filters: { titleOnly: true } });
+  assert.equal(requested.searchParams.get('query.title'), 'protein folding');
+  assert.equal(requested.searchParams.get('query.bibliographic'), null);
+});
+
+test('openalex quotes filter values, because a comma inside one is a syntax error', async () => {
+  // Measured live: filter=title.search:cells, tissues answers 400 "A filter value contains
+  // an unescaped comma". Commas separate FILTERS, so any query or author name carrying one
+  // removed OpenAlex from the search entirely. Percent-encoding is rejected too; quoting is
+  // what the API accepts.
+  let requested = null;
+  stubFetch(async (url) => { requested = new URL(url); return jsonRes({ results: [] }); });
+  await searchOne('openalex', {
+    query: 'cells, tissues',
+    filters: { titleOnly: true, author: 'Smith, John', yearFrom: 2020 },
+  });
+  assert.equal(
+    requested.searchParams.get('filter'),
+    'title.search:"cells, tissues",from_publication_date:2020-01-01,raw_author_name.search:"Smith, John"',
+  );
+});
+
+test('a DOI lookup emits the same fields as a search row', async () => {
+  // venue/citationCount/type were simply absent from the lookup's record. An absent field is
+  // not a null one: every consumer between here and the host reads the record raw, so a DOI
+  // lookup produced a row shaped unlike every search row.
+  stubFetch(async () => jsonRes({
+    message: {
+      DOI: '10.1234/abc', title: ['A paper'], type: 'journal-article',
+      'container-title': ['Journal of Things'], 'is-referenced-by-count': 42,
+    },
+  }));
+  const out = await searchOne('crossref', { query: '10.1234/abc' });
+  const r = out.results[0];
+  for (const k of ['title', 'doi', 'url', 'pdfUrl', 'authors', 'year', 'abstract',
+    'venue', 'citationCount', 'type', 'source']) {
+    assert.ok(k in r, `a DOI lookup must emit ${k}`);
+  }
+  assert.equal(r.venue, 'Journal of Things');
+  assert.equal(r.citationCount, 42);
+  assert.equal(r.type, 'journal-article');
+});
+
+test('semanticscholar declares the filters its search endpoint cannot express', async () => {
+  // `query` is one free-text match over the whole record -- there is no author or title
+  // field. Both filters were accepted and then never sent, so the caller believed S2 had
+  // applied them and skipped its own local pass.
+  stubFetch(async () => jsonRes({ data: [] }));
+  const out = await searchOne('semanticscholar', {
+    query: 'x', filters: { author: 'Hinton', titleOnly: true },
+  });
+  assert.deepEqual(out.unsupported, ['author', 'titleOnly']);
+});
+
 // --- failure behaviour ----------------------------------------------------------------
+
+test('a malformed options object is refused, not thrown', async () => {
+  // searchAll's Promise.all fails the WHOLE page if any searchOne rejects, and destructured
+  // defaults only fire for `undefined` -- so `filters: null` threw on the first property
+  // read and a missing options object threw on the destructuring itself.
+  stubFetch(async () => jsonRes({ papers: [] }));
+  for (const opts of [undefined, null, {}, { query: 'x', filters: null }, { query: 'x', page: null }]) {
+    const out = await searchOne('ssrn', opts);
+    assert.ok(out && Array.isArray(out.results), 'a result group is returned rather than a rejection');
+  }
+  // A null page must fall back to 1 rather than reach the API as "NaN".
+  let requested = null;
+  stubFetch(async (url) => { requested = new URL(url); return jsonRes({ papers: [] }); });
+  await searchOne('ssrn', { query: 'x', page: null });
+  assert.equal(requested.searchParams.get('page'), '1');
+});
 
 test('a failing source costs its own results and nothing else', async () => {
   // searchAll uses Promise.all, which is only safe because searchOne never rejects. If a

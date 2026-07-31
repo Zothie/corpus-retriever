@@ -26,6 +26,13 @@ import { credentialsFor, urlTier, TIER } from './allowlist.js';
 const PDF_MAGIC = '%PDF-';
 /** Matches the extension's own transfer ceiling. */
 const MAX_PDF_BYTES = 80 * 1024 * 1024;
+/**
+ * The floor under a "pdf". A header, one object, an xref and a trailer cannot fit in less,
+ * so anything smaller is a stub or an error page that merely starts with the magic -- and
+ * accepting one costs the user the paper, because a win ENDS the ladder and the sources that
+ * held the real file are never asked.
+ */
+const MIN_PDF_BYTES = 512;
 /** One source may not hold the whole ladder. Publishers get longer -- a human may be there. */
 const CHEAP_SOURCE_TIMEOUT_MS = 25000;
 
@@ -55,10 +62,26 @@ export async function fetchValidatedPdf(url, { timeoutMs = CHEAP_SOURCE_TIMEOUT_
     const buf = await res.arrayBuffer();
     if (buf.byteLength > MAX_PDF_BYTES) return { ok: false, error: 'too large' };
     if (buf.byteLength < 5) return { ok: false, error: `too short (${buf.byteLength})` };
+    // Shorter than the origin SAID it was sending means the connection was cut mid-transfer.
+    // The magic survives that, so without this check a half-downloaded paper validates, wins
+    // the ladder, and the complete copy the next source held is never fetched. Only a
+    // MISMATCH is fatal -- a chunked or compressed response declares no length at all.
+    if (Number.isFinite(declared) && declared > 0 && buf.byteLength < declared) {
+      return { ok: false, error: `truncated (${buf.byteLength} of ${declared})` };
+    }
     const magic = new TextDecoder().decode(new Uint8Array(buf, 0, 5));
     if (magic !== PDF_MAGIC) {
       return { ok: false, error: `not a pdf (starts with ${JSON.stringify(magic)})` };
     }
+    if (buf.byteLength < MIN_PDF_BYTES) {
+      return { ok: false, error: `too small to be a pdf (${buf.byteLength})` };
+    }
+    // A real pdf carries a trailer; a fragment that merely STARTS like one does not. Read
+    // from the end, which is where %%EOF lives and where a truncation shows.
+    const tail = new TextDecoder('latin1').decode(
+      new Uint8Array(buf, buf.byteLength - Math.min(2048, buf.byteLength)),
+    );
+    if (!/%%EOF/.test(tail)) return { ok: false, error: 'pdf has no trailer (truncated)' };
     return { ok: true, buf, bytes: buf.byteLength };
   } catch (err) {
     return { ok: false, error: `${err.name}: ${err.message}` };

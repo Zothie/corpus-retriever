@@ -439,16 +439,22 @@ test('every anonymous-tier host is granted in the manifest', () => {
   const src = readFileSync(join(repoRoot, 'extension/allowlist.js'), 'utf8');
   const block = /const ANONYMOUS_HOSTS = \[([\s\S]*?)\];/.exec(src);
   assert.ok(block, 'ANONYMOUS_HOSTS not found');
-  // Line-wise, and comments stripped first: a quoted string picked out of the whole block
-  // also matches the apostrophe in a comment ("the user's own browser"), which produced a
-  // fake host name rather than a real finding.
+  // Comments stripped first, then EVERY quoted host on the line -- not just a line holding
+  // exactly one.
+  //
+  // The one-host-per-line form was the bug. Over half the list is written several hosts to
+  // a line ("'aps.org', 'journals.aps.org', 'aip.org',"), and the old pattern anchored on a
+  // whole line, so it silently skipped 72 of 127 entries -- including every object-storage
+  // host. This test reported a green manifest for two thirds of a list it never read.
+  //
+  // Comments must still go first: a quoted string picked out of the raw block also matches
+  // the apostrophe in prose ("the user's own browser"), which invents a host name.
   const hosts = block[1]
     .split('\n')
-    .filter((line) => !/^\s*\/\//.test(line))
-    .map((line) => /^\s*'([^']+)'\s*,?\s*$/.exec(line))
-    .filter(Boolean)
-    .map((m) => m[1]);
-  assert.ok(hosts.length > 0);
+    .map((line) => line.replace(/\/\/.*$/, ''))
+    .flatMap((line) => [...line.matchAll(/'([^']+)'/g)].map((m) => m[1]));
+  // Pinned against the list silently shrinking back to the shape that hid the gap.
+  assert.ok(hosts.length > 100, `only ${hosts.length} anonymous hosts parsed -- the parser is skipping entries`);
 
   const ungranted = hosts.filter((h) => !granted(h));
   assert.deepEqual(

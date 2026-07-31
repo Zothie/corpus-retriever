@@ -83,6 +83,11 @@ async function loadBackground() {
       onCreated: {
         addListener: (l) => onCreatedListeners.add(l),
         removeListener: (l) => onCreatedListeners.delete(l),
+        // Exposed so a test can fire a tab the fake did not create -- a tab of the USER'S
+        // own. Without this the mid-download test read `__listeners || []`, which was
+        // undefined, so it iterated an empty array: no tab was ever announced and the
+        // assertion "9001 was not closed" passed against a tab that never existed.
+        __listeners: onCreatedListeners,
       },
       onUpdated: {
         addListener: (l) => onUpdatedListeners.add(l),
@@ -425,6 +430,38 @@ test('one call never closes another concurrent call\'s tab', async () => {
   assert.equal(removed.length, 2, 'each tab closed exactly once');
 });
 
+test('an ADOPTED handoff tab is protected from a concurrent call too', async () => {
+  // Only the CREATED tab used to reach tabsOwnedByAnyCall, so a handoff tab adopted by
+  // opener chain -- the target=_blank case the adoption logic exists for -- stayed invisible
+  // to every other call. A second call for the same url could then re-adopt it and close it
+  // mid-fetch. Registering on adoption, not just on creation, is what closes that.
+  const { withClearedTab, chrome, removed } = await loadBackground();
+  const url = 'https://www.sciencedirect.com/science/article/pii/S9/pdfft';
+
+  let handoffId = null;
+  let handoffClosedEarly = false;
+  const a = withClearedTab(url, async (tabId) => {
+    const child = chrome.tabs.spawnChild(tabId, 'https://pdf.sciencedirectassets.com/x.pdf');
+    handoffId = child.id;
+    await new Promise((r) => setTimeout(r, 200));
+    handoffClosedEarly = removed.includes(handoffId);
+    return 'a';
+  });
+  // Starts after the handoff exists, and asks for the very url that handoff is showing.
+  await new Promise((r) => setTimeout(r, 40));
+  const b = withClearedTab(url, async (_t, _d, _o, requestUrl) => {
+    requestUrl?.('https://pdf.sciencedirectassets.com/x.pdf');
+    await new Promise((r) => setTimeout(r, 30));
+    return 'b';
+  });
+  await Promise.all([a, b]);
+
+  assert.equal(handoffClosedEarly, false,
+    "a concurrent call must not close the first call's adopted handoff tab");
+  assert.equal(removed.filter((id) => id === handoffId).length, 1,
+    'the handoff tab must be closed exactly once, by its owner');
+});
+
 test('a tab the user opens BY HAND mid-download is never closed', async () => {
   // The user reported this risk and it was real. Measured before the fix: opening the same
   // paper by hand while a download ran got that tab adopted by url and closed in the
@@ -439,10 +476,17 @@ test('a tab the user opens BY HAND mid-download is never closed', async () => {
 
   await withClearedTab(url, async (_tabId, _d, _o, requestUrl) => {
     requestUrl?.(url);
-    // Long enough to be a human rather than a handoff.
-    await new Promise((r) => setTimeout(r, 60));
+    // Long enough to be a human rather than a handoff -- which means PAST
+    // HANDOFF_WINDOW_MS (1500ms), not merely "a little later". This slept 60ms and called
+    // itself human-length, which is inside the handoff window: had the fake ever announced
+    // the tab, the call would have adopted and closed it. The delay has to clear the actual
+    // threshold or the test asserts the opposite of its own title.
+    await new Promise((r) => setTimeout(r, 1700));
     const byHand = { id: 9001, url, status: 'complete' };
-    for (const l of chrome.tabs.onCreated.__listeners || []) l(byHand);
+    const listeners = chrome.tabs.onCreated.__listeners;
+    assert.ok(listeners && listeners.size > 0,
+      'the fake must actually announce the tab, or this test asserts nothing');
+    for (const l of listeners) l(byHand);
     return 'done';
   }, 5000);
 

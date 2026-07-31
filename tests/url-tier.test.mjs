@@ -113,6 +113,55 @@ test('credentialed wins when a host could match both lists', () => {
   assert.equal(credentialsFor('https://api.ssrn.com/papers/v1/papers'), 'omit');
 });
 
+test('the anonymous carve-out covers the whole subtree, not just the exact host', () => {
+  // The hole this closes. The carve-out used to be an EXACT-match test against
+  // ANONYMOUS_HOSTS, so it answered for api.ssrn.com and nothing below it:
+  // sub.api.ssrn.com matched no anonymous entry exactly, fell through to the 'ssrn.com'
+  // suffix in ALLOWED_HOSTS, and came back CREDENTIALED. That is the exact leak the
+  // api.ssrn.com entry exists to prevent, reachable one label further down -- and the host
+  // is DNS-controlled by whoever runs ssrn.com, not by us.
+  //
+  // The rule is now "the more specific grant wins", measured by matched-suffix length, so
+  // 'api.ssrn.com' (12) beats 'ssrn.com' (8) for every host under it.
+  for (const url of [
+    'https://sub.api.ssrn.com/x',
+    'https://a.b.api.ssrn.com/x',
+  ]) {
+    assert.equal(urlTier(url), TIER.ANONYMOUS, url);
+    assert.equal(credentialsFor(url), 'omit', url);
+  }
+
+  // The other direction still holds: a host under the credentialed suffix that is NOT under
+  // any anonymous entry keeps its cookies, and a near-miss name is not caught by accident.
+  assert.equal(urlTier('https://xapi.ssrn.com/x'), TIER.CREDENTIALED);
+  assert.equal(urlTier('https://papers.ssrn.com/x'), TIER.CREDENTIALED);
+});
+
+test('no credentialed host sits underneath an anonymous grant', () => {
+  // The invariant that makes "more specific wins" safe to apply in both directions. If a
+  // publisher were ever added underneath an anonymous entry, the specificity rule could
+  // DOWNGRADE it and the fetch would silently lose the session it needs. Checked against
+  // the real lists rather than argued, so adding such a host fails here instead of in the
+  // field.
+  const src = readFileSync(join(repoRoot, 'extension/allowlist.js'), 'utf8');
+  const list = (name) => {
+    const block = new RegExp(`const ${name} = \\[([\\s\\S]*?)\\];`).exec(src);
+    assert.ok(block, `${name} not found`);
+    return block[1]
+      .split('\n')
+      .map((line) => line.replace(/\/\/.*$/, ''))
+      .flatMap((line) => [...line.matchAll(/'([^']+)'/g)].map((m) => m[1]));
+  };
+  const anonymous = list('ANONYMOUS_HOSTS');
+  const credentialed = list('ALLOWED_HOSTS');
+  assert.ok(anonymous.length > 100 && credentialed.length > 5);
+
+  const shadowed = credentialed
+    .filter((h) => anonymous.some((a) => h === a || h.endsWith(`.${a}`)))
+    .map((h) => `${h} is covered by an anonymous grant`);
+  assert.deepEqual(shadowed, []);
+});
+
 // --- the invariant, enforced structurally -------------------------------------------
 
 test('no fetch in the extension may pass a hardcoded credentials value', () => {

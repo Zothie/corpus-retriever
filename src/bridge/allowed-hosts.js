@@ -351,28 +351,56 @@ export const TIER = {
  * tier from the URL inside the fetch primitive means a caller CANNOT choose, and adding a
  * host to the wrong list is the only way to get it wrong.
  *
- * Checked credentialed-first so a host on both lists gets the stronger grant, and so the
- * anonymous list can never quietly downgrade a publisher.
+ * THE MORE SPECIFIC GRANT WINS, and a tie goes to the credentialed one so the anonymous
+ * list can never quietly downgrade a publisher.
  */
 export function urlTier(url) {
   if (typeof url !== 'string') return TIER.NONE;
-  // An EXACT entry in the anonymous list beats the credentialed SUFFIX grant.
+  // The MORE SPECIFIC entry decides, measured as the length of the matched suffix.
   //
   // api.ssrn.com is the case this exists for. ALLOWED_HOSTS grants 'ssrn.com' by suffix,
   // which would otherwise swallow api.ssrn.com and send the user's SSRN session to a
   // search API that neither needs nor should receive it. papers.ssrn.com is unaffected --
-  // it is not an exact entry here, so it keeps the credentialed grant it has always had.
+  // nothing in the anonymous list matches it at all, so it keeps its credentialed grant.
+  //
+  // Specificity rather than an EXACT-match test, which is what this used to be. An exact
+  // test answered only for api.ssrn.com itself: sub.api.ssrn.com matched no anonymous entry
+  // exactly, fell through to the 'ssrn.com' suffix, and came back CREDENTIALED -- the very
+  // leak the api.ssrn.com carve-out exists to prevent, one label further down. Comparing
+  // suffix lengths closes the whole subtree instead of one hostname.
+  //
+  // Verified against the current lists: no credentialed host sits under any anonymous entry,
+  // so nothing is downgraded by this.
+  let host;
   try {
-    const host = new URL(url).hostname.toLowerCase();
-    if (ANONYMOUS_HOSTS.includes(host)) {
-      // Still has to clear the structural checks below.
-      return anonymousTierFor(url);
-    }
+    host = new URL(url).hostname.toLowerCase();
   } catch {
     return TIER.NONE;
   }
+  const anonymous = grantSpecificity(host, ANONYMOUS_HOSTS);
+  // The path-constrained grant is EXACT-host, so it contributes its own length only when it
+  // is that exact host -- matching it as a suffix here would credit it for subdomains
+  // isAllowedUrl would refuse anyway.
+  const pathConstrained = PATH_CONSTRAINED_HOSTS.some((r) => r.host === host) ? host.length : -1;
+  const credentialed = Math.max(grantSpecificity(host, ALLOWED_HOSTS), pathConstrained);
+  // Still has to clear the structural checks inside anonymousTierFor.
+  if (anonymous > credentialed) return anonymousTierFor(url);
   if (isAllowedUrl(url)) return TIER.CREDENTIALED;
   return anonymousTierFor(url);
+}
+
+/**
+ * How specifically `list` grants `host`: the length of the longest entry that covers it,
+ * or -1 for no match. Only ever compared against another call's answer, so the unit is
+ * arbitrary as long as a longer suffix means a narrower grant -- which it does, since every
+ * entry is matched as "the host itself, or a subdomain of it".
+ */
+function grantSpecificity(host, list) {
+  let best = -1;
+  for (const h of list) {
+    if ((host === h || host.endsWith(`.${h}`)) && h.length > best) best = h.length;
+  }
+  return best;
 }
 
 /**
