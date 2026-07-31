@@ -62,6 +62,14 @@ const MAX_PENDING_PER_CLIENT = 16;
 // The client downstream would otherwise trust whatever arrives.
 const MAX_LINKS = 50;
 const MAX_LINK_CHARS = 2048;
+// The devlog ring buffer is capped at 800 events in extension/devlog.js. Mirrored here for
+// the same reason the link bounds are: the cap is the extension's promise, not this
+// process's guarantee, and the trace is the one reply that used to cross unshaped.
+const MAX_DEVLOG_EVENTS = 1000;
+// One event's `detail`/`evidence` is a handful of small fields (status, byte count, a
+// truncated url). Serialised and capped rather than walked: the shapes vary per event kind
+// and a depth-limited clone would still let a hostile extension nest 1000 deep.
+const MAX_DEVLOG_DETAIL_CHARS = 4096;
 
 /**
  * The two request kinds a socket client may ask for. `pdf` streams a header plus
@@ -131,6 +139,52 @@ export function decodeFrames(state, chunk) {
     messages.push(parsed);
   }
   return { buffer, messages };
+}
+
+/**
+ * Re-shape a devlog trace to the bounded form devlog.js is supposed to produce.
+ *
+ * Exported for the test that proves the bound holds. Every other extension reply is field-
+ * allowlisted at this boundary and this one was not, so a hostile or broken extension could
+ * put a whole 64 MiB frame of arbitrary JSON in front of the socket client. The trace is
+ * evidence for a human to read, so a truncated one is still useful and an unbounded one is
+ * strictly a liability.
+ *
+ * `detail` and `evidence` vary in shape per event kind, so they are serialised and length-
+ * capped rather than walked field by field -- a depth-limited clone would still admit a
+ * thousand-deep nest, and the consumer only ever prints these.
+ */
+export function boundedDevlogReport(report) {
+  if (!report || typeof report !== 'object' || Array.isArray(report)) return { totalMs: 0, events: [] };
+  const cap = (v) => {
+    if (v === undefined || v === null) return undefined;
+    let text;
+    try {
+      text = JSON.stringify(v);
+    } catch {
+      // A cycle, or a value JSON cannot express. Recording that is more useful than dropping
+      // the event, and it is the signal that the far side is not devlog.js.
+      return '[unserialisable]';
+    }
+    if (typeof text !== 'string') return undefined;
+    return text.length <= MAX_DEVLOG_DETAIL_CHARS
+      ? v
+      : `${text.slice(0, MAX_DEVLOG_DETAIL_CHARS)}...[truncated]`;
+  };
+  const events = Array.isArray(report.events) ? report.events.slice(0, MAX_DEVLOG_EVENTS) : [];
+  return {
+    totalMs: Number.isFinite(report.totalMs) ? report.totalMs : 0,
+    events: events.map((e) => (e && typeof e === 'object' ? {
+      kind: typeof e.kind === 'string' ? e.kind.slice(0, 20) : 'unknown',
+      label: typeof e.label === 'string' ? e.label.slice(0, 120) : '',
+      at: Number.isFinite(e.at) ? e.at : null,
+      ms: Number.isFinite(e.ms) ? e.ms : undefined,
+      verdict: typeof e.verdict === 'string' ? e.verdict.slice(0, 40) : undefined,
+      because: typeof e.because === 'string' ? e.because.slice(0, 300) : undefined,
+      evidence: cap(e.evidence),
+      detail: cap(e.detail),
+    } : { kind: 'unknown', label: '', at: null })),
+  };
 }
 
 // --- runtime ----------------------------------------------------------------
@@ -305,7 +359,17 @@ function main() {
     if (!req) return;
 
     if (msg.type === 'devlog_result') {
-      finish(hostId, { ok: true, report: msg.report });
+      if (req.kind !== 'devlog') {
+        fail(hostId, `unexpected ${msg.type} for a ${req.kind} request`);
+        return;
+      }
+      // The ONLY reply that used to cross verbatim. Every other branch re-shapes what the
+      // extension sends, because the extension is the far side of a channel this process
+      // does not control; `report` was handed through whole, so a buggy or replaced
+      // extension could push a frame's worth (64 MiB) of arbitrary JSON straight at the
+      // socket client. The trace is a diagnostic, so it is bounded to the shape devlog.js
+      // actually produces rather than trusted for being one.
+      finish(hostId, { ok: true, report: boundedDevlogReport(msg.report) });
       return;
     }
     if (msg.type === 'reload_extension_result') {

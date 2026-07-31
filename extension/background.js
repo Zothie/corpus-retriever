@@ -2144,6 +2144,22 @@ function isGlobalFailure(error) {
   // is parked for thirty minutes, and every download for the next half hour loses a healthy
   // mirror that was never even asked. Measured against the reverse risk -- one wasted
   // attempt per paper on a source that really is down -- and the wasted attempt is cheaper.
+  //
+  // Removing the literal string was not sufficient on its own, because two of the ladder's
+  // own messages CARRY a clock event inside a health-shaped wording:
+  //
+  //   * firstReachable stops walking when the phase ceiling passes and reports
+  //     `${lastError || 'no mirror answered'} (budget exhausted)`. The default branch puts
+  //     the phrase "no mirror answered" into a string that means "I stopped looking", so
+  //     the annas/libgen callers parked on it exactly as before.
+  //   * annasArticleUrl returns null both when every mirror really was unreachable AND when
+  //     firstReachable ran out of clock, and the caller turns that into the fixed string
+  //     "no reachable annas mirror".
+  //
+  // So the clock marker is checked FIRST and vetoes the whole test. It is appended by the
+  // budget path only, which makes it the one unambiguous signal available here, and a source
+  // that really is down still parks through the messages that do not carry it.
+  if (/budget exhausted|phase ceiling/i.test(error)) return false;
   return /no reachable|no mirror answered|Failed to fetch|NetworkError|ERR_NAME_NOT_RESOLVED|getaddrinfo|ENOTFOUND|TimeoutError|AbortError/i.test(error);
 }
 
@@ -2869,7 +2885,19 @@ async function retrievePaper({ doi, pdfUrl, email, coreApiKey, only, skip }) {
         devDecide('annas', page ? 'has-record' : 'skip',
           page ? 'scidb page stayed on /scidb/' : 'redirected away, unreachable, or challenged',
           { page: page ? String(page).slice(0, 90) : null, lastError: lastMirrorError });
-        if (!page) return { ok: false, error: 'no reachable annas mirror' };
+        // The clock is carried THROUGH, not flattened away. annasArticleUrl returns null for
+        // two unrelated reasons -- every mirror unreachable, or the phase ceiling passing
+        // mid-walk -- and reporting both as "no reachable annas mirror" told parkSource that
+        // a source it never finished asking was down. lastMirrorError is what distinguishes
+        // them, so it is appended rather than logged and dropped.
+        if (!page) {
+          return {
+            ok: false,
+            error: lastMirrorError
+              ? `no reachable annas mirror (${lastMirrorError})`
+              : 'no reachable annas mirror',
+          };
+        }
         // Same bound as sci-hub: annasArticleUrl has already spent part of the phase
         // walking mirrors, so the tab gets what is left rather than the one-hour default.
         const remaining = mirrorDeadline - Date.now();
@@ -3061,14 +3089,26 @@ async function fetchValidatedPdf(url, { timeoutMs = 25000 } = {}) {
     const buf = await res.arrayBuffer();
     if (buf.byteLength > MAX_PDF_BYTES) return { ok: false, error: 'too large' };
     if (buf.byteLength < 5) return { ok: false, error: `too short (${buf.byteLength})` };
-    // The body must match what the origin SAID it was sending. A connection cut mid-transfer
-    // gives a short body with the magic intact, so every check below still passes and a
-    // half-downloaded paper is saved as if it were whole -- and the ladder STOPS, because a
-    // win ends it, so the complete copy the next source held is never fetched. Only a
-    // mismatch is fatal: chunked and compressed responses declare no length at all.
-    if (Number.isFinite(declared) && declared > 0 && buf.byteLength < declared) {
-      return { ok: false, error: `truncated (${buf.byteLength} of ${declared})` };
-    }
+    // NOT compared against content-length, deliberately, and the reason is measured rather
+    // than argued.
+    //
+    // content-length describes the bytes ON THE WIRE. arrayBuffer() hands back the bytes
+    // after CONTENT-ENCODING has been undone, so for any gzip/br/deflate response the two
+    // numbers describe different things and a mismatch is the normal case, not a fault.
+    // Measured in real Chromium (not a stub): a 200,000-byte pdf served with
+    // `content-encoding: gzip` reports content-length 200083 and decodes to 200000 -- so a
+    // `byteLength < declared` test REFUSES a whole, valid file. Cross-origin makes it worse:
+    // content-encoding is not in the CORS-safelist, so without an explicit
+    // access-control-expose-headers the response cannot even tell that it was encoded, while
+    // content-length IS safelisted and stays visible. There is therefore no reliable way to
+    // know from the response whether the comparison is meaningful.
+    //
+    // Nothing is lost by dropping it. The truncation this was meant to catch does not reach
+    // here at all: when a transfer is cut short of a declared content-length, Chrome fails
+    // the request outright -- measured, `fetch` rejects with "TypeError: Failed to fetch"
+    // and arrayBuffer() never resolves. The genuine short-body case is a body with no
+    // declared length, and that one is caught below by the %%EOF trailer check, which tests
+    // the file's own structure instead of a header about the transport.
     const magic = new TextDecoder().decode(new Uint8Array(buf, 0, 5));
     if (magic !== '%PDF-') {
       // A CHALLENGE page is not the same failure as a wrong url, and only the first is worth
@@ -5722,6 +5762,28 @@ const logger = createLogger();
 // The modules rate-limit doi.org lookups. In the extension those are ordinary fetches from
 // the user's own browser at human frequency, so the limiter is a no-op rather than a port.
 const paperRateLimiter = { acquire: async () => {} };
+// sciencedirect-retrieval's access probe calls unpaywallSearch, which lives in
+// academic-apis.js -- an axios/xml2js module that CANNOT be bundled into a worker. The import
+// was stripped and nothing replaced it, so classifyScienceDirectAccess threw ReferenceError
+// on the first probe and every ScienceDirect article silently fell through to "unknown".
+// Ported here as a plain fetch that speaks the same reply shape the probe destructures.
+// Unpaywall requires a contact address and refuses a request without one, so this borrows the
+// worker's own contactEmail() -- the same anonymous per-install address every other OA source
+// uses. Guarded by typeof because this file is also loadable on its own, where that function
+// does not exist; with no address the probe returns no results, which classifies as
+// "unknown", the attempt-anyway branch and the same outcome as an outage.
+async function unpaywallSearch({ doi, email } = {}) {
+  if (!doi) return { content: [{ text: JSON.stringify({ results: [] }) }] };
+  const contact = email
+    || (typeof contactEmail === 'function' ? await contactEmail().catch(() => null) : null);
+  if (!contact) return { content: [{ text: JSON.stringify({ results: [] }) }] };
+  const url = new URL(`https://api.unpaywall.org/v2/${encodeURIComponent(doi)}`);
+  url.searchParams.set('email', contact);
+  const res = await fetch(url.toString(), { headers: { accept: 'application/json' } });
+  if (!res.ok) throw new Error(`unpaywall HTTP ${res.status}`);
+  const data = await res.json();
+  return { content: [{ text: JSON.stringify({ results: [data] }) }] };
+}
 
 // --- src/publishers/doi-path-safety.js ---
 // Is a DOI safe to paste into a URL path?
@@ -6647,7 +6709,12 @@ const sciencedirect_retrieval$PAYWALL_MARKERS = [
  */
 function isPaywallHtml(body) {
   if (!body) return false;
-  const text = (Buffer.isBuffer(body) ? body.subarray(0, 8192).toString('latin1') : String(body).slice(0, 8192))
+  // `Buffer` does not exist in a service worker, and this file is bundled into one. Reaching
+  // for it unguarded made this function throw a ReferenceError there rather than return a
+  // verdict -- latent only because accessGate.isRefusal has no caller yet. Feature-detect so
+  // the Node side still gets the binary path and the worker gets the string path.
+  const isBuffer = typeof Buffer !== 'undefined' && Buffer.isBuffer(body);
+  const text = (isBuffer ? body.subarray(0, 8192).toString('latin1') : String(body).slice(0, 8192))
     .toLowerCase();
   return sciencedirect_retrieval$PAYWALL_MARKERS.some((marker) => text.includes(marker.toLowerCase()));
 }

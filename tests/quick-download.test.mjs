@@ -749,14 +749,40 @@ test('a whole pdf validates', async () => {
   assert.equal(r.ok, true, r.error);
 });
 
-test('a body SHORTER than the origin declared is refused as truncated', async () => {
-  // The failure this exists for is silent: a connection cut mid-transfer leaves the magic
-  // intact, so every other check passes and half a paper is saved as though it were whole.
-  // Worse, a win ENDS the ladder -- the source that held the complete file is never asked.
-  const { fetchValidatedPdf } = load({}, bodyResponse(wholePdf, { 'content-length': '999999' }));
+test('a COMPRESSED pdf is accepted even though the declared length is larger', async () => {
+  // The regression this pins. A `byteLength < content-length` test looks like a truncation
+  // check and is really an encoding bug: content-length counts the bytes ON THE WIRE, while
+  // arrayBuffer() returns them after content-encoding has been undone, so for every gzip or
+  // brotli response the two numbers legitimately disagree.
+  //
+  // Measured in real Chromium rather than assumed: a 200,000-byte pdf served with
+  // `content-encoding: gzip` reports content-length 200083 and decodes to 200000. Under the
+  // old check that whole, valid file was refused as "truncated" -- and because a refusal
+  // moves the ladder on, the paper could be lost to a source that had served it correctly.
+  // Cross-origin it is undetectable too: content-encoding is not CORS-safelisted, so the
+  // response cannot even report that it was compressed, while content-length stays visible.
+  //
+  // Real truncation is not what this gave up. A transfer cut short of a declared
+  // content-length does not reach this code at all -- Chrome fails the request and fetch
+  // rejects with "TypeError: Failed to fetch" (measured). A short body with NO declared
+  // length is caught by the %%EOF trailer check below, which reads the file's own structure.
+  const { fetchValidatedPdf } = load({}, bodyResponse(wholePdf, {
+    'content-length': String(wholePdf.length + 83),
+    'content-encoding': 'gzip',
+  }));
+  const r = await fetchValidatedPdf('https://arxiv.org/pdf/2301.00001');
+  assert.equal(r.ok, true, r.error);
+});
+
+test('a truncated body with no declared length is still caught, by its missing trailer', async () => {
+  // The genuine short-transfer case the length comparison was reaching for. A cut connection
+  // leaves the %PDF- magic intact, so the front of the file proves nothing; what a half-sent
+  // document lacks is its END. Structure, not a header about the transport.
+  const cut = wholePdf.slice(0, Math.floor(wholePdf.length / 2));
+  const { fetchValidatedPdf } = load({}, bodyResponse(cut));
   const r = await fetchValidatedPdf('https://arxiv.org/pdf/2301.00001');
   assert.equal(r.ok, false);
-  assert.match(r.error, /truncated/);
+  assert.match(r.error, /trailer|too small/);
 });
 
 test('a pdf with no trailer is refused', async () => {

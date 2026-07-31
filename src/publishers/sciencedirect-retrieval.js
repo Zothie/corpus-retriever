@@ -276,7 +276,12 @@ const PAYWALL_MARKERS = [
  */
 export function isPaywallHtml(body) {
   if (!body) return false;
-  const text = (Buffer.isBuffer(body) ? body.subarray(0, 8192).toString('latin1') : String(body).slice(0, 8192))
+  // `Buffer` does not exist in a service worker, and this file is bundled into one. Reaching
+  // for it unguarded made this function throw a ReferenceError there rather than return a
+  // verdict -- latent only because accessGate.isRefusal has no caller yet. Feature-detect so
+  // the Node side still gets the binary path and the worker gets the string path.
+  const isBuffer = typeof Buffer !== 'undefined' && Buffer.isBuffer(body);
+  const text = (isBuffer ? body.subarray(0, 8192).toString('latin1') : String(body).slice(0, 8192))
     .toLowerCase();
   return PAYWALL_MARKERS.some((marker) => text.includes(marker.toLowerCase()));
 }

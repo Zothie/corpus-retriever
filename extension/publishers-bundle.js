@@ -13,6 +13,28 @@ const logger = createLogger();
 // The modules rate-limit doi.org lookups. In the extension those are ordinary fetches from
 // the user's own browser at human frequency, so the limiter is a no-op rather than a port.
 const paperRateLimiter = { acquire: async () => {} };
+// sciencedirect-retrieval's access probe calls unpaywallSearch, which lives in
+// academic-apis.js -- an axios/xml2js module that CANNOT be bundled into a worker. The import
+// was stripped and nothing replaced it, so classifyScienceDirectAccess threw ReferenceError
+// on the first probe and every ScienceDirect article silently fell through to "unknown".
+// Ported here as a plain fetch that speaks the same reply shape the probe destructures.
+// Unpaywall requires a contact address and refuses a request without one, so this borrows the
+// worker's own contactEmail() -- the same anonymous per-install address every other OA source
+// uses. Guarded by typeof because this file is also loadable on its own, where that function
+// does not exist; with no address the probe returns no results, which classifies as
+// "unknown", the attempt-anyway branch and the same outcome as an outage.
+async function unpaywallSearch({ doi, email } = {}) {
+  if (!doi) return { content: [{ text: JSON.stringify({ results: [] }) }] };
+  const contact = email
+    || (typeof contactEmail === 'function' ? await contactEmail().catch(() => null) : null);
+  if (!contact) return { content: [{ text: JSON.stringify({ results: [] }) }] };
+  const url = new URL(`https://api.unpaywall.org/v2/${encodeURIComponent(doi)}`);
+  url.searchParams.set('email', contact);
+  const res = await fetch(url.toString(), { headers: { accept: 'application/json' } });
+  if (!res.ok) throw new Error(`unpaywall HTTP ${res.status}`);
+  const data = await res.json();
+  return { content: [{ text: JSON.stringify({ results: [data] }) }] };
+}
 
 // --- src/publishers/doi-path-safety.js ---
 // Is a DOI safe to paste into a URL path?
@@ -938,7 +960,12 @@ const sciencedirect_retrieval$PAYWALL_MARKERS = [
  */
 function isPaywallHtml(body) {
   if (!body) return false;
-  const text = (Buffer.isBuffer(body) ? body.subarray(0, 8192).toString('latin1') : String(body).slice(0, 8192))
+  // `Buffer` does not exist in a service worker, and this file is bundled into one. Reaching
+  // for it unguarded made this function throw a ReferenceError there rather than return a
+  // verdict -- latent only because accessGate.isRefusal has no caller yet. Feature-detect so
+  // the Node side still gets the binary path and the worker gets the string path.
+  const isBuffer = typeof Buffer !== 'undefined' && Buffer.isBuffer(body);
+  const text = (isBuffer ? body.subarray(0, 8192).toString('latin1') : String(body).slice(0, 8192))
     .toLowerCase();
   return sciencedirect_retrieval$PAYWALL_MARKERS.some((marker) => text.includes(marker.toLowerCase()));
 }

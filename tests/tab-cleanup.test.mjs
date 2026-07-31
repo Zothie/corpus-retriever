@@ -438,24 +438,40 @@ test('an ADOPTED handoff tab is protected from a concurrent call too', async () 
   const { withClearedTab, chrome, removed } = await loadBackground();
   const url = 'https://www.sciencedirect.com/science/article/pii/S9/pdfft';
 
+  // ORDER MATTERS, and getting it wrong is what made the first version of this test vacuous.
+  // The handoff has to be spawned AFTER the second call has started.
+  //
+  // withClearedTab ignores any tab it did not itself see created -- the `seen` filter, which
+  // is what stops a user's own tab being adopted. A handoff spawned BEFORE call b begins is
+  // outside b's `seen` set, so b could never have touched it whatever the registry did: the
+  // assertion held against the unfixed code too and proved nothing. Spawning it while b is
+  // live puts it inside b's `seen` set, which is the only arrangement in which
+  // tabsOwnedByAnyCall is the thing standing between b and another call's live tab.
+  const handoff = 'https://pdf.sciencedirectassets.com/x.pdf';
   let handoffId = null;
   let handoffClosedEarly = false;
+  let bStarted;
+  const bIsRunning = new Promise((r) => { bStarted = r; });
+
   const a = withClearedTab(url, async (tabId) => {
-    const child = chrome.tabs.spawnChild(tabId, 'https://pdf.sciencedirectassets.com/x.pdf');
+    await bIsRunning;
+    const child = chrome.tabs.spawnChild(tabId, handoff);
     handoffId = child.id;
     await new Promise((r) => setTimeout(r, 200));
     handoffClosedEarly = removed.includes(handoffId);
     return 'a';
   });
-  // Starts after the handoff exists, and asks for the very url that handoff is showing.
-  await new Promise((r) => setTimeout(r, 40));
+  // Asks for the very url the handoff will show, so URL-adoption is live inside b and only
+  // the shared registry can stop it.
   const b = withClearedTab(url, async (_t, _d, _o, requestUrl) => {
-    requestUrl?.('https://pdf.sciencedirectassets.com/x.pdf');
-    await new Promise((r) => setTimeout(r, 30));
+    requestUrl?.(handoff);
+    bStarted();
+    await new Promise((r) => setTimeout(r, 140));
     return 'b';
   });
   await Promise.all([a, b]);
 
+  assert.ok(handoffId !== null, 'the handoff tab was never spawned');
   assert.equal(handoffClosedEarly, false,
     "a concurrent call must not close the first call's adopted handoff tab");
   assert.equal(removed.filter((id) => id === handoffId).length, 1,

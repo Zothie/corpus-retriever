@@ -19,6 +19,20 @@ import { urlTier, credentialsFor, TIER, isAllowedUrl } from '../src/bridge/allow
 
 const repoRoot = join(dirname(fileURLToPath(import.meta.url)), '..');
 
+/**
+ * The EXTENSION's own copy of the tier logic, evaluated as a plain script.
+ *
+ * The shipping decision is made by extension/allowlist.js (inlined into background.js), not
+ * by the Node bridge copy this file imports at the top. A test that asks only the bridge can
+ * be green while the code that actually talks to publishers leaks, so any assertion about a
+ * grant boundary has to ask this one too.
+ */
+function loadExtensionCopy() {
+  const src = readFileSync(join(repoRoot, 'extension/allowlist.js'), 'utf8')
+    .replace(/^export /gm, '');
+  return new Function(`${src}\nreturn { urlTier, credentialsFor, isAllowedUrl, TIER };`)();
+}
+
 test('publishers are credentialed, and unchanged by the split', () => {
   for (const url of [
     'https://papers.ssrn.com/sol3/papers.cfm?abstract_id=1',
@@ -123,18 +137,32 @@ test('the anonymous carve-out covers the whole subtree, not just the exact host'
   //
   // The rule is now "the more specific grant wins", measured by matched-suffix length, so
   // 'api.ssrn.com' (12) beats 'ssrn.com' (8) for every host under it.
+  // BOTH copies, not just the Node one this file imports.
+  //
+  // This assertion used to run against src/bridge/allowed-hosts.js alone, and the leak it
+  // describes is in code that SHIPS -- the copy inlined into extension/background.js, via
+  // extension/allowlist.js. Reverting the extension copy to the old exact-match rule left
+  // this test green while sub.api.ssrn.com was once again being handed the user's SSRN
+  // cookies, which is the whole failure the test is named after. Parity is asserted
+  // elsewhere, but parity checks a fixed handful of urls and did not include this one, so
+  // the leak fell between the two. Each copy is now exercised directly.
+  const extension = loadExtensionCopy();
   for (const url of [
     'https://sub.api.ssrn.com/x',
     'https://a.b.api.ssrn.com/x',
   ]) {
-    assert.equal(urlTier(url), TIER.ANONYMOUS, url);
-    assert.equal(credentialsFor(url), 'omit', url);
+    assert.equal(urlTier(url), TIER.ANONYMOUS, `bridge: ${url}`);
+    assert.equal(credentialsFor(url), 'omit', `bridge: ${url}`);
+    assert.equal(extension.urlTier(url), extension.TIER.ANONYMOUS, `extension: ${url}`);
+    assert.equal(extension.credentialsFor(url), 'omit', `extension: ${url}`);
   }
 
   // The other direction still holds: a host under the credentialed suffix that is NOT under
   // any anonymous entry keeps its cookies, and a near-miss name is not caught by accident.
-  assert.equal(urlTier('https://xapi.ssrn.com/x'), TIER.CREDENTIALED);
-  assert.equal(urlTier('https://papers.ssrn.com/x'), TIER.CREDENTIALED);
+  for (const url of ['https://xapi.ssrn.com/x', 'https://papers.ssrn.com/x']) {
+    assert.equal(urlTier(url), TIER.CREDENTIALED, `bridge: ${url}`);
+    assert.equal(extension.urlTier(url), extension.TIER.CREDENTIALED, `extension: ${url}`);
+  }
 });
 
 test('no credentialed host sits underneath an anonymous grant', () => {
