@@ -2148,19 +2148,29 @@ function isGlobalFailure(error) {
   // Removing the literal string was not sufficient on its own, because two of the ladder's
   // own messages CARRY a clock event inside a health-shaped wording:
   //
-  //   * firstReachable stops walking when the phase ceiling passes and reports
-  //     `${lastError || 'no mirror answered'} (budget exhausted)`. The default branch puts
-  //     the phrase "no mirror answered" into a string that means "I stopped looking", so
-  //     the annas/libgen callers parked on it exactly as before.
+  //   * firstReachable stops walking when the phase ceiling passes and appends
+  //     "(budget exhausted)". With nothing observed it says "no mirror answered
+  //     (budget exhausted)" -- health-shaped wording for "I stopped looking", which the
+  //     annas/libgen callers parked on exactly as before.
   //   * annasArticleUrl returns null both when every mirror really was unreachable AND when
   //     firstReachable ran out of clock, and the caller turns that into the fixed string
   //     "no reachable annas mirror".
   //
-  // So the clock marker is checked FIRST and vetoes the whole test. It is appended by the
-  // budget path only, which makes it the one unambiguous signal available here, and a source
-  // that really is down still parks through the messages that do not carry it.
+  // The clock marker therefore vetoes -- but ONLY when the string carries no observed
+  // transport failure, and that ordering is the correction to round two.
+  //
+  // A veto that ran first swallowed the opposite failure. The two conditions are not
+  // exclusive: a source can be genuinely unreachable AND have its walk run past the ceiling,
+  // and firstReachable now reports both ("TypeError: Failed to fetch (budget exhausted)")
+  // instead of discarding the first. Vetoing on the clock marker alone therefore turned a
+  // real DNS failure or refused connection into "do not park" whenever it happened to be
+  // slow -- which is precisely the outage case parking exists for, and slow is exactly how
+  // an unreachable host fails. So an OBSERVED failure is checked first and wins; the clock
+  // marker only decides the case where nothing was observed at all.
+  const observed = /Failed to fetch|NetworkError|ERR_NAME_NOT_RESOLVED|getaddrinfo|ENOTFOUND|TimeoutError|AbortError/i;
+  if (observed.test(error)) return true;
   if (/budget exhausted|phase ceiling/i.test(error)) return false;
-  return /no reachable|no mirror answered|Failed to fetch|NetworkError|ERR_NAME_NOT_RESOLVED|getaddrinfo|ENOTFOUND|TimeoutError|AbortError/i.test(error);
+  return /no reachable|no mirror answered/i.test(error);
 }
 
 /** Sources currently parked, as { name: expiryMs }. Never throws. */
@@ -5354,23 +5364,40 @@ function mirrorPhaseExhausted() {
 }
 
 async function firstReachable(hosts, pathFor) {
-  let lastError = null;
+  // lastMirrorError is a MODULE-level variable that getTextMirror writes and that nothing
+  // ever cleared, so on entry it still held whatever the PREVIOUS source's last failed probe
+  // set. The annas and libgen callers append it to their error strings and isGlobalFailure
+  // reads those, so a stale value from an earlier source decided whether THIS one gets
+  // parked. Cleared here, the one place that owns a whole mirror walk.
+  lastMirrorError = null;
   const deadline = boundedDeadline(SOURCE_BUDGET_MS_MIRROR);
+  let probed = false;
   for (const host of hosts) {
     // Stop walking once the budget is gone: 14 hosts at 12s each is minutes, and the
     // remaining ones are no more likely to answer than the ones that just did not.
     if (Date.now() > deadline) {
-      lastMirrorError = `${lastError || 'no mirror answered'} (budget exhausted)`;
+      // The clock marker is APPENDED to what the last probe actually said, not substituted
+      // for it. This read `lastError`, a local that NOTHING ever assigned -- getTextMirror
+      // writes lastMirrorError, not it -- so the `||` default always won and the real reason
+      // was discarded. That mattered once round two taught isGlobalFailure to veto on
+      // "budget exhausted": a genuine outage whose walk happened to run past the ceiling had
+      // its "TypeError: Failed to fetch" replaced by the vetoed wording, so a source that
+      // really was down stopped being parked. Both facts are reported now, and the veto
+      // regexp is ordered so the outage still wins.
+      lastMirrorError = `${lastMirrorError || 'no mirror answered'} (budget exhausted)`;
       return null;
     }
     if (urlTier(`https://${host}/`) !== TIER.ANONYMOUS) continue;
+    probed = true;
     const info = {};
     const body = await getTextMirror(
       `https://${host}${pathFor(host)}`, PROBE_TIMEOUT_MS_MIRROR, info,
     );
     if (body !== null) return { host, body, finalUrl: info.finalUrl };
   }
-  if (lastError) lastMirrorError = lastError;
+  // Walked the whole list without a budget stop. If not one host was even eligible there is
+  // no probe result to quote, and saying so beats reporting a probe that never ran.
+  if (!probed) lastMirrorError = 'no mirror was eligible';
   return null;
 }
 

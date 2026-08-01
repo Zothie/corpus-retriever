@@ -70,6 +70,11 @@ const MAX_DEVLOG_EVENTS = 1000;
 // truncated url). Serialised and capped rather than walked: the shapes vary per event kind
 // and a depth-limited clone would still let a hostile extension nest 1000 deep.
 const MAX_DEVLOG_DETAIL_CHARS = 4096;
+// The WHOLE reply's allowance, which is the bound that actually matters. Capping each field
+// at 4096 bounds nothing on its own: 1000 events x {detail, evidence} is 8 MB, and that is
+// what a hostile-but-cap-respecting trace really produced (measured, 8,058,024 bytes). A
+// genuine 800-event trace of real devlog records is well under this.
+const MAX_DEVLOG_REPORT_CHARS = 512 * 1024;
 
 /**
  * The two request kinds a socket client may ask for. `pdf` streams a header plus
@@ -153,37 +158,98 @@ export function decodeFrames(state, chunk) {
  * `detail` and `evidence` vary in shape per event kind, so they are serialised and length-
  * capped rather than walked field by field -- a depth-limited clone would still admit a
  * thousand-deep nest, and the consumer only ever prints these.
+ *
+ * Three things this has to survive, each of which defeated an earlier version:
+ *
+ *   * A THROWING GETTER. `e.detail` is a property read, and reading it runs the getter. The
+ *     first version did that read in the argument position of cap(), i.e. OUTSIDE cap's own
+ *     try, so `Object.defineProperty(e, 'detail', { get() { throw } })` propagated straight
+ *     out of the map and past this function -- measured. Every field read is inside a try now.
+ *   * THE AGGREGATE, not just the field. A per-field cap of 4096 across 1000 events and two
+ *     fields is 8 MB, and that is what 1000 events each carrying two just-under-cap strings
+ *     really produced -- measured at 8,058,024 bytes, which is not a bound in any useful
+ *     sense. A running total is kept and the trace is cut off when it is spent.
+ *   * A value that is BIG but not a string. `{ toJSON: () => 'z'.repeat(5e6) }` and a
+ *     200,000-element array both serialise past the cap, so the cap is applied to the
+ *     SERIALISED text and the truncated form is returned as a string. Under the cap the
+ *     original value is returned so a legitimate `{ status: 503 }` stays an object.
  */
 export function boundedDevlogReport(report) {
   if (!report || typeof report !== 'object' || Array.isArray(report)) return { totalMs: 0, events: [] };
-  const cap = (v) => {
+  // Every read of a field on the far side's object goes through here. The object is not
+  // ours: any property on it may be an accessor that throws, and one that does must cost its
+  // own field rather than the whole reply.
+  const read = (obj, key) => {
+    try {
+      return obj[key];
+    } catch {
+      return undefined;
+    }
+  };
+  const str = (obj, key, max) => {
+    const v = read(obj, key);
+    return typeof v === 'string' ? v.slice(0, max) : undefined;
+  };
+  const num = (obj, key) => {
+    const v = read(obj, key);
+    return Number.isFinite(v) ? v : undefined;
+  };
+  // What is LEFT of the whole-report allowance. Decremented by every field admitted, so the
+  // reply cannot grow past it however the events are shaped.
+  let budget = MAX_DEVLOG_REPORT_CHARS;
+  const cap = (obj, key) => {
+    const v = read(obj, key);
     if (v === undefined || v === null) return undefined;
+    if (budget <= 0) return '[omitted: report size cap]';
     let text;
     try {
       text = JSON.stringify(v);
     } catch {
-      // A cycle, or a value JSON cannot express. Recording that is more useful than dropping
-      // the event, and it is the signal that the far side is not devlog.js.
+      // A cycle, a BigInt, or a toJSON that throws. Recording that is more useful than
+      // dropping the event, and it is the signal that the far side is not devlog.js.
+      budget -= 16;
       return '[unserialisable]';
     }
     if (typeof text !== 'string') return undefined;
-    return text.length <= MAX_DEVLOG_DETAIL_CHARS
-      ? v
-      : `${text.slice(0, MAX_DEVLOG_DETAIL_CHARS)}...[truncated]`;
+    const limit = Math.min(MAX_DEVLOG_DETAIL_CHARS, budget);
+    if (text.length <= limit) {
+      budget -= text.length;
+      return v;
+    }
+    budget -= limit;
+    return `${text.slice(0, limit)}...[truncated]`;
   };
-  const events = Array.isArray(report.events) ? report.events.slice(0, MAX_DEVLOG_EVENTS) : [];
+  const raw = Array.isArray(report.events) ? report.events.slice(0, MAX_DEVLOG_EVENTS) : [];
+  const events = [];
+  for (const e of raw) {
+    if (budget <= 0) break;
+    if (!e || typeof e !== 'object') {
+      // A non-object event still costs its slot, so an array of 100,000 strings cannot
+      // become 100,000 stub objects.
+      budget -= 40;
+      events.push({ kind: 'unknown', label: '', at: null });
+      continue;
+    }
+    const kind = str(e, 'kind', 20);
+    const label = str(e, 'label', 120);
+    const at = num(e, 'at');
+    const shaped = {
+      kind: kind === undefined ? 'unknown' : kind,
+      label: label === undefined ? '' : label,
+      at: at === undefined ? null : at,
+      ms: num(e, 'ms'),
+      verdict: str(e, 'verdict', 40),
+      because: str(e, 'because', 300),
+      evidence: cap(e, 'evidence'),
+      detail: cap(e, 'detail'),
+    };
+    budget -= (shaped.kind.length + shaped.label.length
+      + (shaped.verdict?.length || 0) + (shaped.because?.length || 0) + 40);
+    events.push(shaped);
+  }
   return {
     totalMs: Number.isFinite(report.totalMs) ? report.totalMs : 0,
-    events: events.map((e) => (e && typeof e === 'object' ? {
-      kind: typeof e.kind === 'string' ? e.kind.slice(0, 20) : 'unknown',
-      label: typeof e.label === 'string' ? e.label.slice(0, 120) : '',
-      at: Number.isFinite(e.at) ? e.at : null,
-      ms: Number.isFinite(e.ms) ? e.ms : undefined,
-      verdict: typeof e.verdict === 'string' ? e.verdict.slice(0, 40) : undefined,
-      because: typeof e.because === 'string' ? e.because.slice(0, 300) : undefined,
-      evidence: cap(e.evidence),
-      detail: cap(e.detail),
-    } : { kind: 'unknown', label: '', at: null })),
+    events,
   };
 }
 

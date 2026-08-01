@@ -835,6 +835,41 @@ test('a spent phase budget does NOT park a source', () => {
   // A genuine outage still parks.
   assert.equal(isGlobalFailure('no reachable annas mirror'), true);
   assert.equal(isGlobalFailure('TypeError: Failed to fetch'), true);
+  // The clock veto reaches the callers' own wordings too, which is where it was needed:
+  // both wrap firstReachable's string, and the "no mirror answered" inside it is
+  // health-shaped wording for "I stopped looking".
+  assert.equal(
+    isGlobalFailure('no reachable annas mirror (no mirror answered (budget exhausted))'), false,
+  );
+  assert.equal(
+    isGlobalFailure('not on libgen (no mirror answered (budget exhausted))'), false,
+  );
+});
+
+test('an outage that ran PAST the ceiling still parks the source', () => {
+  // The opposite failure, and the one the first version of the clock veto caused.
+  //
+  // "unreachable" and "the phase ran out" are not exclusive -- a host that is down fails by
+  // being SLOW, so an outage running past the ceiling is the normal shape of one, not an
+  // edge case. firstReachable reports both facts in one string, and a veto that tested the
+  // clock marker first answered "do not park" for every one of them: the source really was
+  // observed to be down, and the breaker stopped firing in precisely the case it exists for.
+  //
+  // An OBSERVED transport failure therefore outranks the clock marker. The marker only
+  // decides the case where nothing was observed at all.
+  const { isGlobalFailure } = load();
+  assert.equal(
+    isGlobalFailure('no reachable annas mirror (TypeError: Failed to fetch (budget exhausted))'),
+    true,
+  );
+  assert.equal(
+    isGlobalFailure('not on libgen (getaddrinfo ENOTFOUND libgen.is (budget exhausted))'),
+    true,
+  );
+  assert.equal(
+    isGlobalFailure('no reachable annas mirror (TimeoutError: signal timed out (budget exhausted))'),
+    true,
+  );
 });
 
 test('a phase skipped for want of an email SAYS so', async () => {

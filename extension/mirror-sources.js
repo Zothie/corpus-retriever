@@ -153,23 +153,40 @@ function mirrorPhaseExhausted() {
 }
 
 async function firstReachable(hosts, pathFor) {
-  let lastError = null;
+  // lastMirrorError is a MODULE-level variable that getTextMirror writes and that nothing
+  // ever cleared, so on entry it still held whatever the PREVIOUS source's last failed probe
+  // set. The annas and libgen callers append it to their error strings and isGlobalFailure
+  // reads those, so a stale value from an earlier source decided whether THIS one gets
+  // parked. Cleared here, the one place that owns a whole mirror walk.
+  lastMirrorError = null;
   const deadline = boundedDeadline(SOURCE_BUDGET_MS_MIRROR);
+  let probed = false;
   for (const host of hosts) {
     // Stop walking once the budget is gone: 14 hosts at 12s each is minutes, and the
     // remaining ones are no more likely to answer than the ones that just did not.
     if (Date.now() > deadline) {
-      lastMirrorError = `${lastError || 'no mirror answered'} (budget exhausted)`;
+      // The clock marker is APPENDED to what the last probe actually said, not substituted
+      // for it. This read `lastError`, a local that NOTHING ever assigned -- getTextMirror
+      // writes lastMirrorError, not it -- so the `||` default always won and the real reason
+      // was discarded. That mattered once round two taught isGlobalFailure to veto on
+      // "budget exhausted": a genuine outage whose walk happened to run past the ceiling had
+      // its "TypeError: Failed to fetch" replaced by the vetoed wording, so a source that
+      // really was down stopped being parked. Both facts are reported now, and the veto
+      // regexp is ordered so the outage still wins.
+      lastMirrorError = `${lastMirrorError || 'no mirror answered'} (budget exhausted)`;
       return null;
     }
     if (urlTier(`https://${host}/`) !== TIER.ANONYMOUS) continue;
+    probed = true;
     const info = {};
     const body = await getTextMirror(
       `https://${host}${pathFor(host)}`, PROBE_TIMEOUT_MS_MIRROR, info,
     );
     if (body !== null) return { host, body, finalUrl: info.finalUrl };
   }
-  if (lastError) lastMirrorError = lastError;
+  // Walked the whole list without a budget stop. If not one host was even eligible there is
+  // no probe result to quote, and saying so beats reporting a probe that never ran.
+  if (!probed) lastMirrorError = 'no mirror was eligible';
   return null;
 }
 
