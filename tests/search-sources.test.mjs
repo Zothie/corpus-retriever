@@ -372,3 +372,4 @@ test('search-sources declares no hardcoded credentials', () => {
     .replace(/(^|[^:])\/\/.*$/gm, '$1');
   assert.deepEqual(src.match(/credentials:\s*'(include|omit)'/g) || [], []);
 });
+

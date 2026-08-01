@@ -2358,9 +2358,15 @@ async function downloadToBrowser(base64, filename) {
       clearTimeout(timer);
       resolve(out);
     };
+    // The SAVED length travels back with the result. slimPdf recompresses on the way to
+    // disk, so what Chrome wrote is not what the ladder retrieved -- measured 2,419,633
+    // retrieved against 1,380,362 written for the same paper. The caller was reporting the
+    // retrieved figure, which states a size the file does not have and reads exactly like a
+    // truncated download to anyone who checks.
+    const savedBytes = slimmed.byteLength;
     const onChanged = (delta) => {
       if (delta.id !== id || !delta.state) return;
-      if (delta.state.current === 'complete') finish({ ok: true, downloadId: id, filename });
+      if (delta.state.current === 'complete') finish({ ok: true, downloadId: id, filename, bytes: savedBytes });
       else if (delta.state.current === 'interrupted') {
         finish({ ok: false, error: `download interrupted (${delta.error?.current || 'unknown'})` });
       }
@@ -2373,7 +2379,7 @@ async function downloadToBrowser(base64, filename) {
     // attached, and nothing would ever fire.
     chrome.downloads.search({ id }, (items) => {
       const state = items?.[0]?.state;
-      if (state === 'complete') finish({ ok: true, downloadId: id, filename });
+      if (state === 'complete') finish({ ok: true, downloadId: id, filename, bytes: savedBytes });
       else if (state === 'interrupted') finish({ ok: false, error: 'download interrupted' });
     });
   });
@@ -2428,7 +2434,8 @@ async function runDownload(request) {
     return {
       ok: true,
       filename: saved.filename,
-      bytes: got.bytes,
+      // What is ON DISK, which the slimmer made smaller than what the ladder retrieved.
+      bytes: Number.isFinite(saved.bytes) ? saved.bytes : got.bytes,
       source: got.source,
       title: title || null,
     };
@@ -4280,7 +4287,16 @@ async function searchBiorxiv(query, maxResults, page, filters = {}) {
   // it. Crossref caps offset+rows at 10000, so ask for what is reachable and no more.
   const offset = (page - 1) * overFetch;
   if (offset > 0) {
-    if (offset + overFetch > 10000) return { source: 'biorxiv', results: [] };
+    // Crossref refuses offset+rows past 10000. Say so rather than answering with an empty
+    // list: "nothing left" and "I cannot reach that far" are different facts, and returning
+    // [] for the second is the same silent lie this adapter's paging bug already told once.
+    if (offset + overFetch > 10000) {
+      return {
+        source: 'biorxiv',
+        error: `page ${page} is past Crossref's 10000-record window for this query`,
+        results: [],
+      };
+    }
     u.searchParams.set('offset', String(offset));
   }
 
@@ -4573,6 +4589,39 @@ function europePmcType(pubType) {
  * No key and no registration, unlike Semantic Scholar, which answered 429 on three
  * consecutive unauthenticated attempts and was rejected for that reason.
  */
+/**
+ * The cursor chain for one Europe PMC query, remembered between calls.
+ *
+ * Europe PMC pages by CURSOR: page N needs the mark its predecessor returned, and there is no
+ * arithmetic that jumps to a page. Walking from the start every time makes page N cost N
+ * requests, so a reader clicking through results re-fetches everything they have already seen
+ * -- quadratic in the page number, against a public API.
+ *
+ * Caching turns that into one request per page in the common case: paging forward through the
+ * same query only ever walks from the deepest mark already known. The key is the exact query
+ * URL minus the cursor, so a different query, filter or page size gets its own chain and can
+ * never be served another's marks.
+ *
+ * Bounded, because a service worker's memory is not free and a mark is only useful while the
+ * user is still walking that query. Eviction costs a re-walk, never a wrong answer.
+ */
+const EUROPEPMC_CURSORS = new Map();
+const EUROPEPMC_CURSOR_LIMIT = 40;
+
+function cursorChain(key) {
+  let chain = EUROPEPMC_CURSORS.get(key);
+  if (!chain) {
+    chain = ['*'];
+    if (EUROPEPMC_CURSORS.size >= EUROPEPMC_CURSOR_LIMIT) {
+      // Oldest first: Map preserves insertion order, so the front is the least recently
+      // started query.
+      EUROPEPMC_CURSORS.delete(EUROPEPMC_CURSORS.keys().next().value);
+    }
+    EUROPEPMC_CURSORS.set(key, chain);
+  }
+  return chain;
+}
+
 async function searchEuropePmc(query, maxResults, page, filters = {}) {
   const u = new URL('https://www.ebi.ac.uk/europepmc/webservices/rest/search');
   // Europe PMC has its own field syntax: TITLE, AUTH, PUB_YEAR, all ANDed.
@@ -4584,12 +4633,42 @@ async function searchEuropePmc(query, maxResults, page, filters = {}) {
   u.searchParams.set('query', terms.join(' AND '));
   u.searchParams.set('format', 'json');
   u.searchParams.set('pageSize', String(Math.min(maxResults, 100)));
-  u.searchParams.set('page', String(page));
   // `core` rather than the default: the lite response omits the abstract and the journal,
   // which are two of the fields the studio actually stores.
   u.searchParams.set('resultType', 'core');
 
+  // CURSOR paging, not `page=N`.
+  //
+  // Europe PMC accepts `page` and IGNORES it: measured, page=1 and page=2 return byte-identical
+  // ids, and both return the same nextCursorMark. So every page after the first re-served page
+  // one -- invisible, because a repeated result set looks exactly like a source with nothing
+  // more to give. It is the same defect bioRxiv had, by a different route.
+  //
+  // A cursor is a CHAIN: page N needs the mark the API returned for page N-1, so reaching page
+  // N costs N-1 extra requests. That is why this walks rather than jumps, and why the walk is
+  // capped -- a caller asking for page 50 should get an honest refusal, not fifty requests.
+  const chain = cursorChain(u.toString());
+
+  // Walk only the part of the chain that is not already known. Paging forward -- what a
+  // reader actually does -- costs ONE request per page, because the previous page stored the
+  // mark this one needs. A cold jump to page N still walks, but it walks once and every page
+  // it passes through is remembered for next time.
+  for (let i = chain.length; i < page; i += 1) {
+    u.searchParams.set('cursorMark', chain[i - 1]);
+    const step = await getJson(u.toString());
+    if (!step.ok) return { source: 'europepmc', error: step.error, results: [] };
+    const next = step.data?.nextCursorMark;
+    // The mark repeats at the end of the result set. Serving that page again would be
+    // exactly the bug this replaced, so an exhausted cursor answers with nothing.
+    if (!next || next === chain[i - 1]) return { source: 'europepmc', results: [] };
+    chain[i] = next;
+  }
+
+  u.searchParams.set('cursorMark', chain[page - 1]);
   const res = await getJson(u.toString());
+  // Remember where THIS page ends, so the next one is a single request.
+  const after = res.ok ? res.data?.nextCursorMark : null;
+  if (after && after !== chain[page - 1]) chain[page] = after;
   if (!res.ok) return { source: 'europepmc', error: res.error, results: [] };
 
   const results = (res.data?.resultList?.result || []).map((r) => ({
