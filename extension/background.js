@@ -2701,14 +2701,45 @@ async function retrievePaper({ doi, pdfUrl, email, coreApiKey, only, skip }) {
       devDecide(entry.name, 'skip', 'excluded by the caller', null);
     } else if (entry) {
       try {
-        const id = entry.resolveId
-          ? await entry.resolveId(doi, pdfUrl || null, {})
-          : entry.extractId(doi, pdfUrl || null);
+        // ASK BEFORE OPENING A TAB, where the publisher declares a gate.
+        //
+        // ScienceDirect is the only one so far, and the reason is arithmetic: nearly all of
+        // its content is unreachable without a subscription, so spending the full publisher
+        // budget on a tab -- and possibly a human challenge -- for a paper another source
+        // already has free costs the user a minute to learn nothing. The gate answers from
+        // Unpaywall alone, before any tab exists.
+        //
+        // A missing accessGate means "attempt, with the normal budget", so no other entry
+        // needs one and nothing below changes shape.
+        let budget = PUBLISHER_BUDGET_MS;
+        let gated = false;
+        if (entry.accessGate) {
+          const verdict = await entry.accessGate.classify(doi, { email, coreApiKey })
+            .catch(() => null);
+          if (verdict && entry.accessGate.shouldSkip(verdict)) {
+            // Not a failure: a cheaper source has it, and the ladder is still running them.
+            // Saying WHY matters -- an unexplained absence from the attempts log reads as a
+            // source that was never tried at all.
+            devDecide(entry.name, 'skip', `access gate: ${verdict}`, null);
+            attempts.push({
+              source: entry.name,
+              error: `skipped: a free copy is available elsewhere (${verdict})`,
+            });
+            gated = true;
+          } else if (verdict) {
+            budget = entry.accessGate.budgetMs(verdict);
+          }
+        }
+        const id = gated
+          ? null
+          : entry.resolveId
+            ? await entry.resolveId(doi, pdfUrl || null, {})
+            : entry.extractId(doi, pdfUrl || null);
         if (id) {
           const landing = entry.landingUrl(id);
           const direct = entry.pdfUrl(id);
           const out = direct
-            ? await fetchPdf({ url: direct, referer: landing, budgetMs: PUBLISHER_BUDGET_MS })
+            ? await fetchPdf({ url: direct, referer: landing, budgetMs: budget })
             // No constructible pdf url (Mendeley, OUP, ACS): read the link out of the
             // rendered page, then fetch it down the ordinary path.
             : await (async () => {
@@ -2723,7 +2754,7 @@ async function retrievePaper({ doi, pdfUrl, email, coreApiKey, only, skip }) {
               // preferPdfLink pattern, and the bytes are fetched through the tab that
               // rendered the link rather than by the worker.
               const links = await fetchLinks({
-                url: landing, budgetMs: PUBLISHER_BUDGET_MS, crossOrigin: true,
+                url: landing, budgetMs: budget, crossOrigin: true,
               });
               if (!links.ok || !links.links.length) {
                 return { ok: false, error: links.error || 'no pdf links on the page' };
@@ -2744,7 +2775,7 @@ async function retrievePaper({ doi, pdfUrl, email, coreApiKey, only, skip }) {
                 // budgetMs, or this silently inherits the ONE HOUR human-solve default and a
                 // handoff that never clears holds a tab for the rest of the day. Measured on
                 // OUP: the tab opened with budgetMs 3600000 and simply sat there.
-                ? fetchPdf({ url: pick, referer: landing, budgetMs: PUBLISHER_BUDGET_MS })
+                ? fetchPdf({ url: pick, referer: landing, budgetMs: budget })
                 : { ok: false, error: 'no link matched this publisher' };
             })();
           if (out.ok && out.base64) {
@@ -2752,7 +2783,11 @@ async function retrievePaper({ doi, pdfUrl, email, coreApiKey, only, skip }) {
               base64: out.base64, bytes: out.bytes, attempts };
           }
           attempts.push({ source: entry.name, error: out.error || 'publisher produced no pdf' });
-        } else {
+        } else if (!gated) {
+          // Only when the identifier genuinely could not be resolved. A GATED skip already
+          // said why, and adding this beside it claimed a second, false reason for the same
+          // decision -- the log read "skipped: a free copy is available elsewhere" followed
+          // by "could not resolve an identifier", which are not both true.
           attempts.push({ source: entry.name, error: 'could not resolve an identifier' });
         }
       } catch (err) {
