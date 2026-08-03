@@ -2560,6 +2560,17 @@ async function contactEmail() {
 }
 
 async function retrievePaper({ doi, pdfUrl, email, coreApiKey, only, skip }) {
+  // Fall back to the generated per-install address HERE, not only in the callers.
+  //
+  // Two callers already did this and a third did not, so whether the open-access phase ran
+  // at all depended on which entry point was used -- and the symptom is silent: the phase
+  // logs "skipped: no contact email", the ladder drops to publishers and mirrors, and the
+  // result looks like open access was asked and declined. Unpaywall and PMC refuse a request
+  // carrying no address, so this is the difference between the cheapest half of the ladder
+  // running and not existing.
+  //
+  // Doing it here makes the guarantee a property of the ladder rather than of the caller.
+  if (!email) email = await contactEmail();
   // One retrieval, one trace. Without this the log accumulates across runs and a previous
   // run's RESULT line reads as this one's answer -- which is exactly the kind of confusion
   // this logging exists to prevent.
