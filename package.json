@@ -10,7 +10,9 @@
     "test": "node --test tests/",
     "vendor:qpdf": "node scripts/vendor-qpdf.mjs",
     "check": "node --check extension/background.js && node --check extension/popup.js",
-    "test:live": "node tests/search-live.mjs"
+    "test:live": "node tests/search-live.mjs",
+    "release": "sh scripts/build-release.sh",
+    "release:mirrors": "sh scripts/build-release.sh --mirrors"
   },
   "devDependencies": {
     "@neslinesli93/qpdf-wasm": "^0.3.0",

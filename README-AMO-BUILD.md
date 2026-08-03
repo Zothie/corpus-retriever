@@ -1,17 +1,23 @@
 # Build instructions for AMO reviewers
 
-Corpus Retriever 1.0.3 — Firefox package
-`corpus-retriever-1.0.3-firefox-mirrors.xpi`
+Corpus Retriever — Firefox package
+`corpus-retriever-<version>-firefox-mirrors.xpi`
 
 ---
 
 ## TL;DR
 
 ```sh
-./scripts/build-firefox.sh
+./scripts/build-release.sh --mirrors
 ```
 
-Output: `dist-store/corpus-retriever-1.0.3-firefox-mirrors.xpi`
+Output (the Firefox one is the submitted package):
+
+```
+dist-store/corpus-retriever-<version>-firefox-mirrors.xpi
+dist-store/corpus-retriever-<version>-mirrors.zip
+dist-store/corpus-retriever-<version>-SOURCE.zip
+```
 
 ---
 
@@ -50,7 +56,7 @@ zip -v    # any
 
 ## 2. Step-by-step build
 
-The one-command script `./scripts/build-firefox.sh` runs exactly these five steps in order.
+The one-command script `./scripts/build-release.sh` runs exactly these steps in order.
 They are order-dependent — steps 3 and 4 generate files the next step reads.
 
 ```sh
@@ -70,13 +76,13 @@ node scripts/inline-search-sources.mjs
 node scripts/build-store-package.mjs --firefox --with-mirrors
 ```
 
-Result: `dist-store/corpus-retriever-1.0.3-firefox-mirrors.xpi`
+Result: `dist-store/corpus-retriever-<version>-firefox-mirrors.xpi`
 
 To verify the build reproduces the submission:
 
 ```sh
-unzip -p dist-store/corpus-retriever-1.0.3-firefox-mirrors.xpi manifest.json
-# version 1.0.3, background.scripts = ["vendor/qpdf.js","background.js"],
+unzip -p dist-store/corpus-retriever-<version>-firefox-mirrors.xpi manifest.json
+# the submitted version, background.scripts = ["vendor/qpdf.js","background.js"],
 # gecko.id = {5b4e01ed-e5d0-41d0-b57d-409f183d0620}
 ```
 
